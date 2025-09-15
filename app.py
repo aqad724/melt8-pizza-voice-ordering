@@ -34,8 +34,10 @@ LOG_EVENT_TYPES = [
 
 app = FastAPI()
 
-if not OPENAI_API_KEY:
-    raise ValueError("Missing the OpenAI API key. Please set it in Replit secrets.")
+# Allow app to start without API key for webhook testing
+API_KEYS_CONFIGURED = bool(OPENAI_API_KEY)
+if not API_KEYS_CONFIGURED:
+    print("⚠️  Warning: OpenAI API key not configured. Voice features will be limited.")
 
 
 # =========================================
@@ -54,6 +56,11 @@ async def handle_incoming_call(request: Request):
     """Handle Twilio webhook and respond with TwiML to connect audio stream."""
 
     response = VoiceResponse()
+    
+    if not API_KEYS_CONFIGURED:
+        response.say("Webhook is working! However, the AI voice assistant is not fully configured yet. Please add your API keys to enable voice features.")
+        return HTMLResponse(content=str(response), media_type="application/xml")
+    
     response.say("Please wait while we connect your call to the AI voice assistant.")
     response.pause(length=1)
     response.say("Okay, you can start talking!")
@@ -78,6 +85,11 @@ async def handle_incoming_call(request: Request):
 async def handle_media_stream(websocket: WebSocket):
     print("Twilio connected")
     await websocket.accept()
+    
+    if not API_KEYS_CONFIGURED:
+        print("API keys not configured - closing WebSocket connection")
+        await websocket.close()
+        return
 
     async with websockets.connect(
         "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
