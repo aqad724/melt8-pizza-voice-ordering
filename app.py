@@ -160,7 +160,10 @@ async def send_session_update(openai_ws):
             "voice": VOICE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
-            "instructions": "You are a helpful AI assistant. Please respond in a conversational and engaging manner. Follow any specific personality or behavior guidelines you've been configured with."
+            "prompt": {
+                "id": PROMPT_ID,
+                "version": PROMPT_VERSION
+            }
         }
     }
     print("Sending session update:", json.dumps(session_update))
