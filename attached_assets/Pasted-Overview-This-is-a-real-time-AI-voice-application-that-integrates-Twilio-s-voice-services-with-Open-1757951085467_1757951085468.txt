@@ -1,0 +1,40 @@
+Overview
+This is a real-time AI voice application that integrates Twilio's voice services with OpenAI's Realtime API to create an interactive voice assistant. The system allows users to make phone calls and have real-time conversations with an AI agent powered by OpenAI's language model.
+
+User Preferences
+Preferred communication style: Simple, everyday language.
+
+System Architecture
+Backend Architecture
+Framework: FastAPI-based Python web application
+Asynchronous Design: Built with async/await patterns to handle concurrent voice streams and WebSocket connections
+WebSocket Support: Implements real-time bidirectional communication for voice data streaming
+Voice Processing Pipeline
+Voice Input: Receives audio through Twilio's telephony infrastructure
+Real-time Processing: Uses OpenAI's Realtime API for immediate audio-to-text and text-to-audio conversion
+Voice Output: Streams processed audio back through Twilio to the caller
+API Structure
+REST Endpoints: FastAPI routes for handling HTTP requests
+WebSocket Endpoints: Real-time connections for audio streaming
+Webhook Integration: Twilio voice webhooks for call handling
+Configuration Management
+Environment Variables: Uses python-dotenv for secure API key management
+Prompt Configuration: Configurable prompt ID and version system for AI behavior customization
+Voice Settings: Configurable voice selection (currently set to "alloy")
+Event Logging System
+Selective Logging: Monitors specific event types including response completion, rate limits, audio buffer events, and session management
+Real-time Monitoring: Tracks speech detection, audio processing, and session lifecycle events
+External Dependencies
+Core Services
+OpenAI Realtime API: Primary AI processing engine for voice-to-voice conversations
+Twilio Voice API: Telephony infrastructure for handling phone calls and audio streaming
+Python Libraries
+FastAPI: Web framework for building the API server
+websockets: WebSocket client/server implementation for real-time communication
+twilio: Official Twilio SDK for voice response handling and TwiML generation
+python-dotenv: Environment variable management for secure configuration
+uvicorn: ASGI server for running the FastAPI application
+Infrastructure Requirements
+WebSocket Support: Required for real-time audio streaming between services
+HTTPS Endpoints: Necessary for Twilio webhook integration
+Environment Variables: OPENAI_API_KEY must be configured in deployment environment
