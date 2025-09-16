@@ -101,7 +101,7 @@ async def handle_media_stream(websocket: WebSocket):
         await send_session_update(openai_ws)
 
         stream_sid = None
-        audio_queue = asyncio.Queue(maxsize=5)  # ~100ms buffer for instant interruption
+        audio_queue = asyncio.Queue(maxsize=10)  # ~200ms buffer for smooth speech + fast interruption
         drop_audio = False
         ai_speaking = False
 
@@ -303,6 +303,7 @@ async def send_session_update(openai_ws):
             "voice": VOICE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
+            "speed": 0.9,
             "prompt": {
                 "id": PROMPT_ID,
                 "version": PROMPT_VERSION
