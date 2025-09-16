@@ -1,9 +1,6 @@
-import os
-import json
 import base64
 import asyncio
 import websockets
-import time
 import uuid
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse
@@ -17,8 +14,10 @@ load_dotenv()
 # CONFIGURATION
 # =========================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PROMPT_ID = "pmpt_68bdd42ebbb881948ffca4f752efaec406a110ab981d5f90"
-PROMPT_VERSION = "15"
+# You can set PROMPT_ID / PROMPT_VERSION in your .env.
+# If PROMPT_VERSION is empty, OpenAI will use the latest published version for that Prompt ID.
+PROMPT_ID = os.getenv("PROMPT_ID", "pmpt_68bdd42ebbb881948ffca4f752efaec406a110ab981d5f90")
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "")  # leave empty to always use latest published version
 VOICE = "alloy"
 
 LOG_EVENT_TYPES = [
@@ -43,7 +42,11 @@ if not API_KEYS_CONFIGURED:
 # =========================================
 @app.get("/")
 async def index_page():
-    return {"status": "Server running", "info": "Twilio + OpenAI Realtime AI Voice", "active_connections": active_connections}
+    return {
+        "status": "Server running",
+        "info": "Twilio + OpenAI Realtime AI Voice",
+        "active_connections": active_connections
+    }
 
 @app.get("/status")
 async def connection_status():
@@ -62,7 +65,10 @@ async def handle_incoming_call(request: Request):
     response = VoiceResponse()
 
     if not API_KEYS_CONFIGURED:
-        response.say("Webhook is working! However, the AI voice assistant is not fully configured yet. Please add your API keys to enable voice features.")
+        response.say(
+            "Webhook is working! However, the AI voice assistant is not fully configured yet. "
+            "Please add your API keys to enable voice features."
+        )
         return HTMLResponse(content=str(response), media_type="application/xml")
 
     response.say("Please wait while we connect your call to the AI voice assistant.")
@@ -70,7 +76,7 @@ async def handle_incoming_call(request: Request):
     response.say("Okay, you can start talking!")
 
     host = request.url.hostname
-    if not host or host == "127.0.0.1" or host == "localhost":
+    if not host or host in ["127.0.0.1", "localhost"]:
         host = os.getenv("REPLIT_DEV_DOMAIN", request.url.hostname)
 
     connect = Connect()
@@ -130,8 +136,10 @@ async def handle_media_stream(websocket: WebSocket):
                             return False
 
                         samples = _ulaw_to_linear(data)
-                        abs_vals = [abs(x) for x in samples]
+                        if not samples:
+                            return False
 
+                        abs_vals = [abs(x) for x in samples]
                         peak = max(abs_vals)
                         mean_abs = sum(abs_vals) / len(abs_vals)
 
@@ -147,7 +155,7 @@ async def handle_media_stream(websocket: WebSocket):
                     try:
                         async for message in websocket.iter_text():
                             data = json.loads(message)
-                            if data["event"] == "media":
+                            if data.get("event") == "media":
                                 if ai_speaking and detect_speech_energy(data["media"]["payload"]):
                                     print(f"🚀 [{connection_id}] INSTANT interruption detected locally!")
                                     drop_audio = True
@@ -163,7 +171,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 }
                                 await openai_ws.send(json.dumps(audio_append))
 
-                            elif data["event"] == "start":
+                            elif data.get("event") == "start":
                                 stream_sid = data["start"]["streamSid"]
                                 print(f"📞 [{connection_id}] Stream started: {stream_sid}")
                     except Exception as e:
@@ -175,37 +183,36 @@ async def handle_media_stream(websocket: WebSocket):
                         async for openai_message in openai_ws:
                             response = json.loads(openai_message)
 
-                            if response["type"] in LOG_EVENT_TYPES:
+                            if response.get("type") in LOG_EVENT_TYPES:
                                 print(f"Event: {response['type']}", response)
 
-                            if response["type"] == "response.audio.start":
+                            if response.get("type") == "response.audio.start":
                                 ai_speaking = True
                                 print(f"🤖 [{connection_id}] AI started speaking")
 
-                            elif response["type"] == "input_audio_buffer.speech_started":
+                            elif response.get("type") == "input_audio_buffer.speech_started":
                                 print(f"🎤 [{connection_id}] User started speaking - server VAD fallback")
                                 drop_audio = True
                                 ai_speaking = False
 
-                            elif response["type"] == "input_audio_buffer.committed":
+                            elif response.get("type") == "input_audio_buffer.committed":
                                 print(f"🔊 [{connection_id}] User finished speaking - enabling AI audio")
                                 drop_audio = False
 
-                            elif response["type"] == "response.done":
+                            elif response.get("type") == "response.done":
                                 ai_speaking = False
                                 if response.get("response", {}).get("status") == "cancelled":
                                     print(f"❌ [{connection_id}] Response cancelled")
                                 else:
                                     print(f"✅ [{connection_id}] Response completed")
 
-                            if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
+                            if response.get("type") == "response.audio.delta" and response.get("delta") and not drop_audio:
                                 try:
                                     if not ai_speaking:
                                         ai_speaking = True
                                         print(f"🤖 [{connection_id}] AI started speaking (delta)")
 
                                     audio_data = base64.b64decode(response["delta"])
-
                                     frame_size = 160
                                     frame_count = 0
                                     for i in range(0, len(audio_data), frame_size):
@@ -215,7 +222,6 @@ async def handle_media_stream(websocket: WebSocket):
                                         frame = audio_data[i:i + frame_size]
                                         if len(frame) == frame_size and stream_sid:
                                             frame_b64 = base64.b64encode(frame).decode("utf-8")
-
                                             audio_delta = {
                                                 "event": "media",
                                                 "streamSid": stream_sid,
@@ -226,7 +232,6 @@ async def handle_media_stream(websocket: WebSocket):
                                             frame_count += 1
                                             if frame_count % 2 == 0:
                                                 await asyncio.sleep(0)
-
                                 except Exception as e:
                                     print(f"❌ [{connection_id}] Error processing audio delta: {e}")
                     except Exception as e:
@@ -243,9 +248,14 @@ async def handle_media_stream(websocket: WebSocket):
         await websocket.close(code=1011, reason="Upstream connect failed")
 
 # =========================================
-# SESSION UPDATE WITH PROMPT ID + VERSION
+# SESSION UPDATE WITH PROMPT ID + (optional) VERSION
 # =========================================
 async def send_session_update(openai_ws):
+    # Build prompt payload: always include ID; include version only if PROMPT_VERSION set
+    prompt_payload = {"id": PROMPT_ID}
+    if PROMPT_VERSION:
+        prompt_payload["version"] = PROMPT_VERSION
+
     session_update = {
         "type": "session.update",
         "session": {
@@ -261,10 +271,7 @@ async def send_session_update(openai_ws):
             "modalities": ["text", "audio"],
             "temperature": 0.8,
             "speed": 0.9,
-            "prompt": {
-                "id": PROMPT_ID,
-                "version": PROMPT_VERSION
-            }
+            "prompt": prompt_payload
         }
     }
     print("Sending session update:", json.dumps(session_update))
