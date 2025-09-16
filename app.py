@@ -101,6 +101,8 @@ async def handle_media_stream(websocket: WebSocket):
         await send_session_update(openai_ws)
 
         stream_sid = None
+        audio_queue = asyncio.Queue(maxsize=50)  # ~1 second buffer
+        drop_audio = False
 
         async def receive_from_twilio():
             nonlocal stream_sid
@@ -119,32 +121,92 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception as e:
                 print(f"Error receiving from Twilio: {e}")
 
+        async def audio_playback():
+            """Send audio frames to Twilio at 20ms intervals"""
+            nonlocal stream_sid, drop_audio
+            while True:
+                try:
+                    # Wait for audio frame with timeout
+                    audio_frame = await asyncio.wait_for(audio_queue.get(), timeout=0.02)
+                    
+                    if not drop_audio and stream_sid:
+                        audio_delta = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": audio_frame}
+                        }
+                        await websocket.send_json(audio_delta)
+                    
+                    audio_queue.task_done()
+                    
+                except asyncio.TimeoutError:
+                    # No audio available, continue the 20ms loop
+                    continue
+                except Exception as e:
+                    print(f"Error in audio playback: {e}")
+                    break
+
         async def send_to_twilio():
-            nonlocal stream_sid
+            nonlocal stream_sid, drop_audio
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
                     if response["type"] in LOG_EVENT_TYPES:
                         print(f"Event: {response['type']}", response)
 
-                    if response["type"] == "response.audio.delta" and response.get("delta"):
-                        try:
-                            audio_payload = base64.b64encode(
-                                base64.b64decode(response["delta"])
-                            ).decode("utf-8")
+                    # Flush audio queue on interruption
+                    if response["type"] == "input_audio_buffer.speech_started":
+                        print("🎤 User started speaking - flushing audio queue")
+                        drop_audio = True
+                        # Clear the queue
+                        while not audio_queue.empty():
+                            try:
+                                audio_queue.get_nowait()
+                                audio_queue.task_done()
+                            except asyncio.QueueEmpty:
+                                break
+                    
+                    # Handle cancelled responses
+                    elif response["type"] == "response.done":
+                        if response.get("response", {}).get("status") == "cancelled":
+                            print("❌ Response cancelled - flushing remaining audio")
+                            drop_audio = True
+                            # Clear the queue
+                            while not audio_queue.empty():
+                                try:
+                                    audio_queue.get_nowait()
+                                    audio_queue.task_done()
+                                except asyncio.QueueEmpty:
+                                    break
+                        else:
+                            # Reset drop flag for next response
+                            drop_audio = False
 
-                            audio_delta = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": audio_payload}
-                            }
-                            await websocket.send_json(audio_delta)
+                    # Process audio deltas
+                    if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
+                        try:
+                            # Decode audio data
+                            audio_data = base64.b64decode(response["delta"])
+                            
+                            # Split into 20ms frames (160 bytes for G.711 µ-law at 8kHz)
+                            frame_size = 160
+                            for i in range(0, len(audio_data), frame_size):
+                                frame = audio_data[i:i + frame_size]
+                                if len(frame) == frame_size:  # Only send complete frames
+                                    frame_b64 = base64.b64encode(frame).decode("utf-8")
+                                    
+                                    # Add to queue (non-blocking, drop if full)
+                                    try:
+                                        audio_queue.put_nowait(frame_b64)
+                                    except asyncio.QueueFull:
+                                        print("⚠️ Audio queue full, dropping frame")
+                                        
                         except Exception as e:
-                            print(f"Error sending audio to Twilio: {e}")
+                            print(f"Error processing audio delta: {e}")
             except Exception as e:
                 print(f"Error from OpenAI: {e}")
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        await asyncio.gather(receive_from_twilio(), send_to_twilio(), audio_playback())
 
 
 # =========================================
