@@ -101,7 +101,7 @@ async def handle_media_stream(websocket: WebSocket):
         await send_session_update(openai_ws)
 
         stream_sid = None
-        audio_queue = asyncio.Queue(maxsize=10)  # ~200ms buffer for smooth speech + fast interruption
+        audio_queue = asyncio.Queue(maxsize=25)  # ~500ms buffer for smooth speech while keeping fast interruption
         drop_audio = False
         ai_speaking = False
 
@@ -173,7 +173,7 @@ async def handle_media_stream(websocket: WebSocket):
                 print(f"Error receiving from Twilio: {e}")
 
         async def audio_playback():
-            """Send audio frames to Twilio at 20ms intervals"""
+            """Send audio frames to Twilio at optimal intervals"""
             nonlocal stream_sid, drop_audio
             while True:
                 try:
@@ -190,8 +190,12 @@ async def handle_media_stream(websocket: WebSocket):
                     
                     audio_queue.task_done()
                     
+                    # Small delay to maintain 20ms timing without overwhelming Twilio
+                    await asyncio.sleep(0.019)  # Slightly less than 20ms to account for processing time
+                    
                 except asyncio.TimeoutError:
                     # No audio available, continue the 20ms loop
+                    await asyncio.sleep(0.02)
                     continue
                 except Exception as e:
                     print(f"Error in audio playback: {e}")
