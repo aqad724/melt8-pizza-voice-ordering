@@ -101,7 +101,6 @@ async def handle_media_stream(websocket: WebSocket):
         await send_session_update(openai_ws)
 
         stream_sid = None
-        audio_queue = asyncio.Queue(maxsize=25)  # ~500ms buffer for smooth speech while keeping fast interruption
         drop_audio = False
         ai_speaking = False
 
@@ -147,14 +146,6 @@ async def handle_media_stream(websocket: WebSocket):
                             print("🚀 INSTANT interruption detected locally!")
                             drop_audio = True
                             ai_speaking = False
-                            # AGGRESSIVELY flush audio queue immediately
-                            queue_size = audio_queue.qsize()
-                            for _ in range(queue_size):
-                                try:
-                                    audio_queue.get_nowait()
-                                    audio_queue.task_done()
-                                except asyncio.QueueEmpty:
-                                    break
                             # Send cancel to OpenAI to stop generation
                             try:
                                 await openai_ws.send(json.dumps({"type": "response.cancel"}))
@@ -172,34 +163,6 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception as e:
                 print(f"Error receiving from Twilio: {e}")
 
-        async def audio_playback():
-            """Send audio frames to Twilio at optimal intervals"""
-            nonlocal stream_sid, drop_audio
-            while True:
-                try:
-                    # Wait for audio frame with timeout
-                    audio_frame = await asyncio.wait_for(audio_queue.get(), timeout=0.02)
-                    
-                    if not drop_audio and stream_sid:
-                        audio_delta = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": audio_frame}
-                        }
-                        await websocket.send_json(audio_delta)
-                    
-                    audio_queue.task_done()
-                    
-                    # Small delay to maintain 20ms timing without overwhelming Twilio
-                    await asyncio.sleep(0.019)  # Slightly less than 20ms to account for processing time
-                    
-                except asyncio.TimeoutError:
-                    # No audio available, continue the 20ms loop
-                    await asyncio.sleep(0.02)
-                    continue
-                except Exception as e:
-                    print(f"Error in audio playback: {e}")
-                    break
 
         async def send_to_twilio():
             nonlocal stream_sid, drop_audio, ai_speaking
@@ -214,18 +177,11 @@ async def handle_media_stream(websocket: WebSocket):
                         ai_speaking = True
                         print("🤖 AI started speaking")
                     
-                    # Flush audio queue on interruption (fallback)
+                    # Stop audio on interruption (fallback)
                     elif response["type"] == "input_audio_buffer.speech_started":
                         print("🎤 User started speaking - server VAD fallback")
                         drop_audio = True
                         ai_speaking = False
-                        # Clear the queue
-                        while not audio_queue.empty():
-                            try:
-                                audio_queue.get_nowait()
-                                audio_queue.task_done()
-                            except asyncio.QueueEmpty:
-                                break
                     
                     # Reset drop flag when user finishes speaking and AI can respond
                     elif response["type"] == "input_audio_buffer.committed":
@@ -236,14 +192,7 @@ async def handle_media_stream(websocket: WebSocket):
                     elif response["type"] == "response.done":
                         ai_speaking = False
                         if response.get("response", {}).get("status") == "cancelled":
-                            print("❌ Response cancelled - flushing remaining audio")
-                            # Clear the queue but keep drop_audio as is
-                            while not audio_queue.empty():
-                                try:
-                                    audio_queue.get_nowait()
-                                    audio_queue.task_done()
-                                except asyncio.QueueEmpty:
-                                    break
+                            print("❌ Response cancelled")
                         else:
                             print("✅ Response completed")
 
@@ -267,14 +216,19 @@ async def handle_media_stream(websocket: WebSocket):
                                     break
                                     
                                 frame = audio_data[i:i + frame_size]
-                                if len(frame) == frame_size:  # Only send complete frames
+                                if len(frame) == frame_size and stream_sid:  # Only send complete frames
                                     frame_b64 = base64.b64encode(frame).decode("utf-8")
                                     
-                                    # Add to queue (non-blocking, drop if full)
+                                    # Send frame directly to Twilio (no buffering)
                                     try:
-                                        audio_queue.put_nowait(frame_b64)
-                                    except asyncio.QueueFull:
-                                        print("⚠️ Audio queue full, dropping frame")
+                                        audio_delta = {
+                                            "event": "media",
+                                            "streamSid": stream_sid,
+                                            "media": {"payload": frame_b64}
+                                        }
+                                        await websocket.send_json(audio_delta)
+                                    except Exception as e:
+                                        print(f"Error sending audio frame: {e}")
                                     
                                     # Yield every 2 frames for ultra-responsive interruption
                                     frame_count += 1
@@ -286,7 +240,7 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception as e:
                 print(f"Error from OpenAI: {e}")
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio(), audio_playback())
+        await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
 
 # =========================================
