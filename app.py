@@ -3,6 +3,8 @@ import json
 import base64
 import asyncio
 import websockets
+import time
+import uuid
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say
@@ -27,6 +29,10 @@ LOG_EVENT_TYPES = [
     "session.created"
 ]
 app = FastAPI()
+
+# Connection tracking for concurrent calls
+active_connections = 0
+
 # Allow app to start without API key for webhook testing
 API_KEYS_CONFIGURED = bool(OPENAI_API_KEY)
 if not API_KEYS_CONFIGURED:
@@ -36,7 +42,16 @@ if not API_KEYS_CONFIGURED:
 # =========================================
 @app.get("/")
 async def index_page():
-    return {"status": "Server running", "info": "Twilio + OpenAI Realtime AI Voice"}
+    return {"status": "Server running", "info": "Twilio + OpenAI Realtime AI Voice", "active_connections": active_connections}
+
+@app.get("/status")
+async def connection_status():
+    return {
+        "status": "healthy",
+        "active_connections": active_connections,
+        "concurrent_support": "enabled",
+        "api_configured": API_KEYS_CONFIGURED
+    }
 # =========================================
 # TWILIO VOICE WEBHOOK
 # =========================================
@@ -67,154 +82,174 @@ async def handle_incoming_call(request: Request):
 # =========================================
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
-    print("Twilio connected")
+    global active_connections
+    # Generate unique connection ID for tracking
+    connection_id = f"conn_{str(uuid.uuid4())[:8]}"
+    
     await websocket.accept()
 
     if not API_KEYS_CONFIGURED:
-        print("API keys not configured - closing WebSocket connection")
+        print(f"❌ [{connection_id}] API keys not configured - closing WebSocket connection")
         await websocket.close()
         return
-    async with websockets.connect(
-        "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17",
-        additional_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-    ) as openai_ws:
-        await send_session_update(openai_ws)
-        stream_sid = None
-        drop_audio = False
-        ai_speaking = False
-        def _ulaw_to_linear(b):
-            """Convert G.711 µ-law to linear PCM"""
-            out = []
-            for u in b:
-                u = (~u) & 0xFF
-                sign = u & 0x80
-                exp = (u >> 4) & 0x07
-                mant = u & 0x0F
-                sample = ((mant | 0x10) << (exp + 3)) - 132
-                if sign:
-                    sample = -sample
-                out.append(sample)
-            return out
-        def detect_speech_energy(audio_b64):
-            """Proper energy-based VAD for G.711 µ-law"""
+    try:
+        async with websockets.connect(
+            "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17",
+            additional_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        ) as openai_ws:
             try:
-                data = base64.b64decode(audio_b64, validate=False)
-                if not data or len(data) < 80:  # <10ms too short
-                    return False
-                s = _ulaw_to_linear(data)
-                N = len(s)
-                abs_vals = [abs(x) for x in s]
-                mean_abs = sum(abs_vals) / N
-                loud_ratio = sum(1 for v in abs_vals if v > 900) / N
-                peak = max(abs_vals)
-                result = (peak > 2500 and loud_ratio > 0.01) or (mean_abs > 400 and loud_ratio > 0.02)
-                return result
-            except Exception:
-                return False
-        async def receive_from_twilio():
-            nonlocal stream_sid, drop_audio, ai_speaking
-            try:
-                async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    if data["event"] == "media":
-                        # Local preemptive VAD for instant interruption
-                        if ai_speaking and detect_speech_energy(data["media"]["payload"]):
-                            print("🚀 INSTANT interruption detected locally!")
-                            drop_audio = True
-                            ai_speaking = False
-                            # Send cancel to OpenAI to stop generation
-                            try:
-                                await openai_ws.send(json.dumps({"type": "response.cancel"}))
-                            except:
-                                pass
-
-                        audio_append = {
-                            "type": "input_audio_buffer.append",
-                            "audio": data["media"]["payload"]
-                        }
-                        await openai_ws.send(json.dumps(audio_append))
-                    elif data["event"] == "start":
-                        stream_sid = data["start"]["streamSid"]
-                        print(f"Stream started: {stream_sid}")
-            except Exception as e:
-                print(f"Error receiving from Twilio: {e}")
-        async def send_to_twilio():
-            nonlocal stream_sid, drop_audio, ai_speaking
-            try:
-                async for openai_message in openai_ws:
-                    response = json.loads(openai_message)
-                    if response["type"] in LOG_EVENT_TYPES:
-                        print(f"Event: {response['type']}", response)
-                    # Track when AI starts speaking
-                    if response["type"] == "response.audio.start":
-                        ai_speaking = True
-                        print("🤖 AI started speaking")
-
-                    # Stop audio on interruption (fallback)
-                    elif response["type"] == "input_audio_buffer.speech_started":
-                        print("🎤 User started speaking - server VAD fallback")
-                        drop_audio = True
-                        ai_speaking = False
-
-                    # Reset drop flag when user finishes speaking and AI can respond
-                    elif response["type"] == "input_audio_buffer.committed":
-                        print("🔊 User finished speaking - enabling AI audio")
-                        drop_audio = False
-
-                    # Handle cancelled responses
-                    elif response["type"] == "response.done":
-                        ai_speaking = False
-                        if response.get("response", {}).get("status") == "cancelled":
-                            print("❌ Response cancelled")
-                        else:
-                            print("✅ Response completed")
-                    # Process audio deltas with responsive yielding
-                    if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
-                        try:
-                            # Mark AI as speaking on first audio delta
-                            if not ai_speaking:
-                                ai_speaking = True
-                                print("🤖 AI started speaking (delta)")
-
-                            # Decode audio data
-                            audio_data = base64.b64decode(response["delta"])
-
-                            # Split into 20ms frames (160 bytes for G.711 µ-law at 8kHz)
-                            frame_size = 160
-                            frame_count = 0
-                            for i in range(0, len(audio_data), frame_size):
-                                # Check if interrupted while processing
-                                if drop_audio:
-                                    break
-
-                                frame = audio_data[i:i + frame_size]
-                                if len(frame) == frame_size and stream_sid:  # Only send complete frames
-                                    frame_b64 = base64.b64encode(frame).decode("utf-8")
-
-                                    # Send frame directly to Twilio (no buffering)
+                # Only increment counter after successful connections
+                active_connections += 1
+                print(f"🔗 [{connection_id}] Connected successfully (Active: {active_connections})")
+                
+                await send_session_update(openai_ws)
+                stream_sid = None
+                drop_audio = False
+                ai_speaking = False
+                
+                def _ulaw_to_linear(b):
+                    """Convert G.711 µ-law to linear PCM"""
+                    out = []
+                    for u in b:
+                        u = (~u) & 0xFF
+                        sign = u & 0x80
+                        exp = (u >> 4) & 0x07
+                        mant = u & 0x0F
+                        sample = ((mant | 0x10) << (exp + 3)) - 132
+                        if sign:
+                            sample = -sample
+                        out.append(sample)
+                    return out
+                    
+                def detect_speech_energy(audio_b64):
+                    """Proper energy-based VAD for G.711 µ-law"""
+                    try:
+                        data = base64.b64decode(audio_b64, validate=False)
+                        if not data or len(data) < 80:  # <10ms too short
+                            return False
+                        s = _ulaw_to_linear(data)
+                        N = len(s)
+                        abs_vals = [abs(x) for x in s]
+                        mean_abs = sum(abs_vals) / N
+                        loud_ratio = sum(1 for v in abs_vals if v > 900) / N
+                        peak = max(abs_vals)
+                        result = (peak > 2500 and loud_ratio > 0.01) or (mean_abs > 400 and loud_ratio > 0.02)
+                        return result
+                    except Exception:
+                        return False
+                        
+                async def receive_from_twilio():
+                    nonlocal stream_sid, drop_audio, ai_speaking
+                    try:
+                        async for message in websocket.iter_text():
+                            data = json.loads(message)
+                            if data["event"] == "media":
+                                # Local preemptive VAD for instant interruption
+                                if ai_speaking and detect_speech_energy(data["media"]["payload"]):
+                                    print(f"🚀 [{connection_id}] INSTANT interruption detected locally!")
+                                    drop_audio = True
+                                    ai_speaking = False
+                                    # Send cancel to OpenAI to stop generation
                                     try:
-                                        audio_delta = {
-                                            "event": "media",
-                                            "streamSid": stream_sid,
-                                            "media": {"payload": frame_b64}
-                                        }
-                                        await websocket.send_json(audio_delta)
-                                    except Exception as e:
-                                        print(f"Error sending audio frame: {e}")
+                                        await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                                    except:
+                                        pass
 
-                                    # Yield every 2 frames for ultra-responsive interruption
-                                    frame_count += 1
-                                    if frame_count % 2 == 0:
-                                        await asyncio.sleep(0)
+                                audio_append = {
+                                    "type": "input_audio_buffer.append",
+                                    "audio": data["media"]["payload"]
+                                }
+                                await openai_ws.send(json.dumps(audio_append))
+                            elif data["event"] == "start":
+                                stream_sid = data["start"]["streamSid"]
+                                print(f"📞 [{connection_id}] Stream started: {stream_sid}")
+                    except Exception as e:
+                        print(f"❌ [{connection_id}] Error receiving from Twilio: {e}")
+                async def send_to_twilio():
+                    nonlocal stream_sid, drop_audio, ai_speaking
+                    try:
+                        async for openai_message in openai_ws:
+                            response = json.loads(openai_message)
+                            if response["type"] in LOG_EVENT_TYPES:
+                                print(f"Event: {response['type']}", response)
+                            # Track when AI starts speaking
+                            if response["type"] == "response.audio.start":
+                                ai_speaking = True
+                                print(f"🤖 [{connection_id}] AI started speaking")
 
-                        except Exception as e:
-                            print(f"Error processing audio delta: {e}")
+                            # Stop audio on interruption (fallback)
+                            elif response["type"] == "input_audio_buffer.speech_started":
+                                print(f"🎤 [{connection_id}] User started speaking - server VAD fallback")
+                                drop_audio = True
+                                ai_speaking = False
+
+                            # Reset drop flag when user finishes speaking and AI can respond
+                            elif response["type"] == "input_audio_buffer.committed":
+                                print(f"🔊 [{connection_id}] User finished speaking - enabling AI audio")
+                                drop_audio = False
+
+                            # Handle cancelled responses
+                            elif response["type"] == "response.done":
+                                ai_speaking = False
+                                if response.get("response", {}).get("status") == "cancelled":
+                                    print(f"❌ [{connection_id}] Response cancelled")
+                                else:
+                                    print(f"✅ [{connection_id}] Response completed")
+                            # Process audio deltas with responsive yielding
+                            if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
+                                try:
+                                    # Mark AI as speaking on first audio delta
+                                    if not ai_speaking:
+                                        ai_speaking = True
+                                        print(f"🤖 [{connection_id}] AI started speaking (delta)")
+
+                                    # Decode audio data
+                                    audio_data = base64.b64decode(response["delta"])
+
+                                    # Split into 20ms frames (160 bytes for G.711 µ-law at 8kHz)
+                                    frame_size = 160
+                                    frame_count = 0
+                                    for i in range(0, len(audio_data), frame_size):
+                                        # Check if interrupted while processing
+                                        if drop_audio:
+                                            break
+
+                                        frame = audio_data[i:i + frame_size]
+                                        if len(frame) == frame_size and stream_sid:  # Only send complete frames
+                                            frame_b64 = base64.b64encode(frame).decode("utf-8")
+
+                                            # Send frame directly to Twilio (no buffering)
+                                            try:
+                                                audio_delta = {
+                                                    "event": "media",
+                                                    "streamSid": stream_sid,
+                                                    "media": {"payload": frame_b64}
+                                                }
+                                                await websocket.send_json(audio_delta)
+                                            except Exception as e:
+                                                print(f"❌ [{connection_id}] Error sending audio frame: {e}")
+
+                                            # Yield every 2 frames for ultra-responsive interruption
+                                            frame_count += 1
+                                            if frame_count % 2 == 0:
+                                                await asyncio.sleep(0)
+
+                                except Exception as e:
+                                    print(f"❌ [{connection_id}] Error processing audio delta: {e}")
+                    except Exception as e:
+                        print(f"❌ [{connection_id}] Error from OpenAI: {e}")
+                
+                await asyncio.gather(receive_from_twilio(), send_to_twilio())
             except Exception as e:
-                print(f"Error from OpenAI: {e}")
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+                print(f"❌ [{connection_id}] Connection error: {e}")
+            finally:
+                active_connections -= 1
+                print(f"🔌 [{connection_id}] Connection closed (Active: {active_connections})")
+    except Exception as e:
+        print(f"❌ [{connection_id}] Failed to connect to OpenAI: {e}")
 # =========================================
 # SESSION UPDATE WITH PROMPT ID + VERSION
 # =========================================
