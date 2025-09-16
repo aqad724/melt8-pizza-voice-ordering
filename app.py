@@ -25,9 +25,6 @@ LOG_EVENT_TYPES = [
     "response.content.done",
     "rate_limits.updated",
     "response.done",
-    "input_audio_buffer.committed",
-    "input_audio_buffer.speech_stopped",
-    "input_audio_buffer.speech_started",
     "session.created"
 ]
 
@@ -109,6 +106,9 @@ async def handle_media_stream(websocket: WebSocket):
                 drop_audio = False
                 ai_speaking = False
 
+                # =========================================
+                # UTILS
+                # =========================================
                 def _ulaw_to_linear(b):
                     out = []
                     for u in b:
@@ -123,7 +123,7 @@ async def handle_media_stream(websocket: WebSocket):
                     return out
 
                 def detect_speech_energy(audio_b64):
-                    """Fast energy-based VAD aligned with prefix_padding_ms=0"""
+                    """Simple energy-based VAD for barge-in detection"""
                     try:
                         data = base64.b64decode(audio_b64, validate=False)
                         if not data:
@@ -135,21 +135,24 @@ async def handle_media_stream(websocket: WebSocket):
                         peak = max(abs_vals)
                         mean_abs = sum(abs_vals) / len(abs_vals)
 
-                        # Fire instantly on strong peak or steady energy
                         if peak > 2000 or mean_abs > 300:
                             return True
                         return False
                     except Exception:
                         return False
 
+                # =========================================
+                # RECEIVE AUDIO FROM TWILIO
+                # =========================================
                 async def receive_from_twilio():
                     nonlocal stream_sid, drop_audio, ai_speaking
                     try:
                         async for message in websocket.iter_text():
                             data = json.loads(message)
                             if data["event"] == "media":
+                                # Detect barge-in from user speech
                                 if ai_speaking and detect_speech_energy(data["media"]["payload"]):
-                                    print(f"🚀 [{connection_id}] INSTANT interruption detected locally!")
+                                    print(f"🚀 [{connection_id}] Barge-in detected! Cancelling AI immediately.")
                                     drop_audio = True
                                     ai_speaking = False
                                     try:
@@ -169,6 +172,9 @@ async def handle_media_stream(websocket: WebSocket):
                     except Exception as e:
                         print(f"❌ [{connection_id}] Error receiving from Twilio: {e}")
 
+                # =========================================
+                # SEND AUDIO TO TWILIO
+                # =========================================
                 async def send_to_twilio():
                     nonlocal stream_sid, drop_audio, ai_speaking
                     try:
@@ -180,36 +186,27 @@ async def handle_media_stream(websocket: WebSocket):
 
                             if response["type"] == "response.audio.start":
                                 ai_speaking = True
-                                print(f"🤖 [{connection_id}] AI started speaking")
-
-                            elif response["type"] == "input_audio_buffer.speech_started":
-                                print(f"🎤 [{connection_id}] User started speaking - server VAD fallback")
-                                drop_audio = True
-                                ai_speaking = False
-
-                            elif response["type"] == "input_audio_buffer.committed":
-                                print(f"🔊 [{connection_id}] User finished speaking - enabling AI audio")
                                 drop_audio = False
+                                print(f"🤖 [{connection_id}] AI started speaking")
 
                             elif response["type"] == "response.done":
                                 ai_speaking = False
-                                if response.get("response", {}).get("status") == "cancelled":
-                                    print(f"❌ [{connection_id}] Response cancelled")
-                                else:
-                                    print(f"✅ [{connection_id}] Response completed")
+                                drop_audio = False
+                                print(f"✅ [{connection_id}] Response completed")
 
-                            if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
+                            if response["type"] == "response.audio.delta":
+                                if drop_audio:
+                                    continue  # 🚫 discard all queued AI audio
+
                                 try:
                                     if not ai_speaking:
                                         ai_speaking = True
                                         print(f"🤖 [{connection_id}] AI started speaking (delta)")
 
                                     audio_data = base64.b64decode(response["delta"])
-
                                     frame_size = 160
-                                    frame_count = 0
                                     for i in range(0, len(audio_data), frame_size):
-                                        if drop_audio:
+                                        if drop_audio:  # 🚨 stop immediately if interruption happened
                                             break
 
                                         frame = audio_data[i:i + frame_size]
@@ -223,9 +220,8 @@ async def handle_media_stream(websocket: WebSocket):
                                             }
                                             await websocket.send_json(audio_delta)
 
-                                            frame_count += 1
-                                            if frame_count % 2 == 0:
-                                                await asyncio.sleep(0)
+                                            # small pacing to match Twilio streaming rate
+                                            await asyncio.sleep(0.02)
 
                                 except Exception as e:
                                     print(f"❌ [{connection_id}] Error processing audio delta: {e}")
@@ -253,7 +249,7 @@ async def send_session_update(openai_ws):
                 "type": "server_vad",
                 "threshold": 0.50,
                 "prefix_padding_ms": 0,
-                "silence_duration_ms": 500
+                "silence_duration_ms": 400  # tweakable for responsiveness
             },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
