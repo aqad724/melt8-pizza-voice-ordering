@@ -8,20 +8,15 @@ from fastapi.responses import HTMLResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say
 from dotenv import load_dotenv
 import uvicorn
-
 load_dotenv()
-
 # =========================================
 # CONFIGURATION
 # =========================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 # Replace with your Prompt ID + Version
 PROMPT_ID = "pmpt_68bdd42ebbb881948ffca4f752efaec406a110ab981d5f90"
 PROMPT_VERSION = "7"
-
 VOICE = "alloy"
-
 LOG_EVENT_TYPES = [
     "response.content.done",
     "rate_limits.updated",
@@ -31,53 +26,42 @@ LOG_EVENT_TYPES = [
     "input_audio_buffer.speech_started",
     "session.created"
 ]
-
 app = FastAPI()
-
 # Allow app to start without API key for webhook testing
 API_KEYS_CONFIGURED = bool(OPENAI_API_KEY)
 if not API_KEYS_CONFIGURED:
     print("⚠️  Warning: OpenAI API key not configured. Voice features will be limited.")
-
-
 # =========================================
 # ROOT ENDPOINT
 # =========================================
 @app.get("/")
 async def index_page():
     return {"status": "Server running", "info": "Twilio + OpenAI Realtime AI Voice"}
-
-
 # =========================================
 # TWILIO VOICE WEBHOOK
 # =========================================
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle Twilio webhook and respond with TwiML to connect audio stream."""
-
     response = VoiceResponse()
-    
+
     if not API_KEYS_CONFIGURED:
         response.say("Webhook is working! However, the AI voice assistant is not fully configured yet. Please add your API keys to enable voice features.")
         return HTMLResponse(content=str(response), media_type="application/xml")
-    
+
     response.say("Please wait while we connect your call to the AI voice assistant.")
     response.pause(length=1)
     response.say("Okay, you can start talking!")
-
     # Get the host from the request or environment
     host = request.url.hostname
     if not host or host == "127.0.0.1" or host == "localhost":
         # Use environment domain for Replit
         host = os.getenv("REPLIT_DEV_DOMAIN", request.url.hostname)
-    
+
     connect = Connect()
     connect.stream(url=f"wss://{host}/media-stream")
     response.append(connect)
-
     return HTMLResponse(content=str(response), media_type="application/xml")
-
-
 # =========================================
 # MEDIA STREAM HANDLER
 # =========================================
@@ -85,12 +69,11 @@ async def handle_incoming_call(request: Request):
 async def handle_media_stream(websocket: WebSocket):
     print("Twilio connected")
     await websocket.accept()
-    
+
     if not API_KEYS_CONFIGURED:
         print("API keys not configured - closing WebSocket connection")
         await websocket.close()
         return
-
     async with websockets.connect(
         "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17",
         additional_headers={
@@ -99,11 +82,9 @@ async def handle_media_stream(websocket: WebSocket):
         }
     ) as openai_ws:
         await send_session_update(openai_ws)
-
         stream_sid = None
         drop_audio = False
         ai_speaking = False
-
         def _ulaw_to_linear(b):
             """Convert G.711 µ-law to linear PCM"""
             out = []
@@ -117,7 +98,6 @@ async def handle_media_stream(websocket: WebSocket):
                     sample = -sample
                 out.append(sample)
             return out
-
         def detect_speech_energy(audio_b64):
             """Proper energy-based VAD for G.711 µ-law"""
             try:
@@ -134,7 +114,6 @@ async def handle_media_stream(websocket: WebSocket):
                 return result
             except Exception:
                 return False
-
         async def receive_from_twilio():
             nonlocal stream_sid, drop_audio, ai_speaking
             try:
@@ -151,7 +130,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 await openai_ws.send(json.dumps({"type": "response.cancel"}))
                             except:
                                 pass
-                        
+
                         audio_append = {
                             "type": "input_audio_buffer.append",
                             "audio": data["media"]["payload"]
@@ -162,8 +141,6 @@ async def handle_media_stream(websocket: WebSocket):
                         print(f"Stream started: {stream_sid}")
             except Exception as e:
                 print(f"Error receiving from Twilio: {e}")
-
-
         async def send_to_twilio():
             nonlocal stream_sid, drop_audio, ai_speaking
             try:
@@ -171,23 +148,22 @@ async def handle_media_stream(websocket: WebSocket):
                     response = json.loads(openai_message)
                     if response["type"] in LOG_EVENT_TYPES:
                         print(f"Event: {response['type']}", response)
-
                     # Track when AI starts speaking
                     if response["type"] == "response.audio.start":
                         ai_speaking = True
                         print("🤖 AI started speaking")
-                    
+
                     # Stop audio on interruption (fallback)
                     elif response["type"] == "input_audio_buffer.speech_started":
                         print("🎤 User started speaking - server VAD fallback")
                         drop_audio = True
                         ai_speaking = False
-                    
+
                     # Reset drop flag when user finishes speaking and AI can respond
                     elif response["type"] == "input_audio_buffer.committed":
                         print("🔊 User finished speaking - enabling AI audio")
                         drop_audio = False
-                    
+
                     # Handle cancelled responses
                     elif response["type"] == "response.done":
                         ai_speaking = False
@@ -195,7 +171,6 @@ async def handle_media_stream(websocket: WebSocket):
                             print("❌ Response cancelled")
                         else:
                             print("✅ Response completed")
-
                     # Process audio deltas with responsive yielding
                     if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
                         try:
@@ -203,10 +178,10 @@ async def handle_media_stream(websocket: WebSocket):
                             if not ai_speaking:
                                 ai_speaking = True
                                 print("🤖 AI started speaking (delta)")
-                            
+
                             # Decode audio data
                             audio_data = base64.b64decode(response["delta"])
-                            
+
                             # Split into 20ms frames (160 bytes for G.711 µ-law at 8kHz)
                             frame_size = 160
                             frame_count = 0
@@ -214,11 +189,11 @@ async def handle_media_stream(websocket: WebSocket):
                                 # Check if interrupted while processing
                                 if drop_audio:
                                     break
-                                    
+
                                 frame = audio_data[i:i + frame_size]
                                 if len(frame) == frame_size and stream_sid:  # Only send complete frames
                                     frame_b64 = base64.b64encode(frame).decode("utf-8")
-                                    
+
                                     # Send frame directly to Twilio (no buffering)
                                     try:
                                         audio_delta = {
@@ -229,20 +204,17 @@ async def handle_media_stream(websocket: WebSocket):
                                         await websocket.send_json(audio_delta)
                                     except Exception as e:
                                         print(f"Error sending audio frame: {e}")
-                                    
+
                                     # Yield every 2 frames for ultra-responsive interruption
                                     frame_count += 1
                                     if frame_count % 2 == 0:
                                         await asyncio.sleep(0)
-                                        
+
                         except Exception as e:
                             print(f"Error processing audio delta: {e}")
             except Exception as e:
                 print(f"Error from OpenAI: {e}")
-
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
-
-
 # =========================================
 # SESSION UPDATE WITH PROMPT ID + VERSION
 # =========================================
@@ -270,8 +242,6 @@ async def send_session_update(openai_ws):
     }
     print("Sending session update:", json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
-
-
 # =========================================
 # MAIN
 # =========================================
