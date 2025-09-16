@@ -105,14 +105,35 @@ async def handle_media_stream(websocket: WebSocket):
         drop_audio = False
         ai_speaking = False
 
+        def _ulaw_to_linear(b):
+            """Convert G.711 µ-law to linear PCM"""
+            out = []
+            for u in b:
+                u = (~u) & 0xFF
+                sign = u & 0x80
+                exp = (u >> 4) & 0x07
+                mant = u & 0x0F
+                sample = ((mant | 0x10) << (exp + 3)) - 132
+                if sign:
+                    sample = -sample
+                out.append(sample)
+            return out
+
         def detect_speech_energy(audio_b64):
-            """Simple energy-based VAD for G.711 µ-law"""
+            """Proper energy-based VAD for G.711 µ-law"""
             try:
-                audio_bytes = base64.b64decode(audio_b64)
-                # G.711 µ-law silence is around 0xFF (255)
-                non_silence = sum(1 for b in audio_bytes if abs(b - 255) > 10)
-                return non_silence > len(audio_bytes) * 0.05  # >5% non-silence
-            except:
+                data = base64.b64decode(audio_b64, validate=False)
+                if not data or len(data) < 80:  # <10ms too short
+                    return False
+                s = _ulaw_to_linear(data)
+                N = len(s)
+                abs_vals = [abs(x) for x in s]
+                mean_abs = sum(abs_vals) / N
+                loud_ratio = sum(1 for v in abs_vals if v > 900) / N
+                peak = max(abs_vals)
+                result = (peak > 4000 and loud_ratio > 0.02) or (mean_abs > 700 and loud_ratio > 0.04)
+                return result
+            except Exception:
                 return False
 
         async def receive_from_twilio():
@@ -224,6 +245,11 @@ async def handle_media_stream(websocket: WebSocket):
                     # Process audio deltas with responsive yielding
                     if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
                         try:
+                            # Mark AI as speaking on first audio delta
+                            if not ai_speaking:
+                                ai_speaking = True
+                                print("🤖 AI started speaking (delta)")
+                            
                             # Decode audio data
                             audio_data = base64.b64decode(response["delta"])
                             
