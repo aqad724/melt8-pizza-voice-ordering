@@ -101,15 +101,44 @@ async def handle_media_stream(websocket: WebSocket):
         await send_session_update(openai_ws)
 
         stream_sid = None
-        audio_queue = asyncio.Queue(maxsize=50)  # ~1 second buffer
+        audio_queue = asyncio.Queue(maxsize=20)  # ~400ms buffer for faster interruption
         drop_audio = False
+        ai_speaking = False
+
+        def detect_speech_energy(audio_b64):
+            """Simple energy-based VAD for G.711 µ-law"""
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+                # G.711 µ-law silence is around 0xFF (255)
+                non_silence = sum(1 for b in audio_bytes if abs(b - 255) > 10)
+                return non_silence > len(audio_bytes) * 0.05  # >5% non-silence
+            except:
+                return False
 
         async def receive_from_twilio():
-            nonlocal stream_sid
+            nonlocal stream_sid, drop_audio, ai_speaking
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
                     if data["event"] == "media":
+                        # Local preemptive VAD for instant interruption
+                        if ai_speaking and detect_speech_energy(data["media"]["payload"]):
+                            print("🚀 INSTANT interruption detected locally!")
+                            drop_audio = True
+                            ai_speaking = False
+                            # Flush audio queue immediately
+                            while not audio_queue.empty():
+                                try:
+                                    audio_queue.get_nowait()
+                                    audio_queue.task_done()
+                                except asyncio.QueueEmpty:
+                                    break
+                            # Send cancel to OpenAI to stop generation
+                            try:
+                                await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                            except:
+                                pass
+                        
                         audio_append = {
                             "type": "input_audio_buffer.append",
                             "audio": data["media"]["payload"]
@@ -147,17 +176,23 @@ async def handle_media_stream(websocket: WebSocket):
                     break
 
         async def send_to_twilio():
-            nonlocal stream_sid, drop_audio
+            nonlocal stream_sid, drop_audio, ai_speaking
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
                     if response["type"] in LOG_EVENT_TYPES:
                         print(f"Event: {response['type']}", response)
 
-                    # Flush audio queue on interruption
-                    if response["type"] == "input_audio_buffer.speech_started":
-                        print("🎤 User started speaking - flushing audio queue")
+                    # Track when AI starts speaking
+                    if response["type"] == "response.audio.start":
+                        ai_speaking = True
+                        print("🤖 AI started speaking")
+                    
+                    # Flush audio queue on interruption (fallback)
+                    elif response["type"] == "input_audio_buffer.speech_started":
+                        print("🎤 User started speaking - server VAD fallback")
                         drop_audio = True
+                        ai_speaking = False
                         # Clear the queue
                         while not audio_queue.empty():
                             try:
@@ -173,6 +208,7 @@ async def handle_media_stream(websocket: WebSocket):
                     
                     # Handle cancelled responses
                     elif response["type"] == "response.done":
+                        ai_speaking = False
                         if response.get("response", {}).get("status") == "cancelled":
                             print("❌ Response cancelled - flushing remaining audio")
                             # Clear the queue but keep drop_audio as is
@@ -185,7 +221,7 @@ async def handle_media_stream(websocket: WebSocket):
                         else:
                             print("✅ Response completed")
 
-                    # Process audio deltas
+                    # Process audio deltas with responsive yielding
                     if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
                         try:
                             # Decode audio data
@@ -193,7 +229,12 @@ async def handle_media_stream(websocket: WebSocket):
                             
                             # Split into 20ms frames (160 bytes for G.711 µ-law at 8kHz)
                             frame_size = 160
+                            frame_count = 0
                             for i in range(0, len(audio_data), frame_size):
+                                # Check if interrupted while processing
+                                if drop_audio:
+                                    break
+                                    
                                 frame = audio_data[i:i + frame_size]
                                 if len(frame) == frame_size:  # Only send complete frames
                                     frame_b64 = base64.b64encode(frame).decode("utf-8")
@@ -203,6 +244,11 @@ async def handle_media_stream(websocket: WebSocket):
                                         audio_queue.put_nowait(frame_b64)
                                     except asyncio.QueueFull:
                                         print("⚠️ Audio queue full, dropping frame")
+                                    
+                                    # Yield every 5 frames to keep event loop responsive
+                                    frame_count += 1
+                                    if frame_count % 5 == 0:
+                                        await asyncio.sleep(0)
                                         
                         except Exception as e:
                             print(f"Error processing audio delta: {e}")
@@ -221,9 +267,9 @@ async def send_session_update(openai_ws):
         "session": {
             "turn_detection": {
                 "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 500
+                "threshold": 0.3,
+                "prefix_padding_ms": 150,
+                "silence_duration_ms": 300
             },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
