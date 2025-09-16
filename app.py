@@ -250,6 +250,7 @@ async def handle_media_stream(websocket: WebSocket):
                 print(f"🔌 [{connection_id}] Connection closed (Active: {active_connections})")
     except Exception as e:
         print(f"❌ [{connection_id}] Failed to connect to OpenAI: {e}")
+        await websocket.close(code=1011, reason="Upstream connect failed")
 # =========================================
 # SESSION UPDATE WITH PROMPT ID + VERSION
 # =========================================
