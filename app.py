@@ -15,7 +15,7 @@ load_dotenv()
 # CONFIG
 # ================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-24-12-17"
 FRAME_SIZE = 640  # 20ms at 16kHz
 
 # ================================
