@@ -101,7 +101,7 @@ async def handle_media_stream(websocket: WebSocket):
         await send_session_update(openai_ws)
 
         stream_sid = None
-        audio_queue = asyncio.Queue(maxsize=20)  # ~400ms buffer for faster interruption
+        audio_queue = asyncio.Queue(maxsize=5)  # ~100ms buffer for instant interruption
         drop_audio = False
         ai_speaking = False
 
@@ -131,7 +131,7 @@ async def handle_media_stream(websocket: WebSocket):
                 mean_abs = sum(abs_vals) / N
                 loud_ratio = sum(1 for v in abs_vals if v > 900) / N
                 peak = max(abs_vals)
-                result = (peak > 4000 and loud_ratio > 0.02) or (mean_abs > 700 and loud_ratio > 0.04)
+                result = (peak > 2500 and loud_ratio > 0.01) or (mean_abs > 400 and loud_ratio > 0.02)
                 return result
             except Exception:
                 return False
@@ -147,8 +147,9 @@ async def handle_media_stream(websocket: WebSocket):
                             print("🚀 INSTANT interruption detected locally!")
                             drop_audio = True
                             ai_speaking = False
-                            # Flush audio queue immediately
-                            while not audio_queue.empty():
+                            # AGGRESSIVELY flush audio queue immediately
+                            queue_size = audio_queue.qsize()
+                            for _ in range(queue_size):
                                 try:
                                     audio_queue.get_nowait()
                                     audio_queue.task_done()
@@ -271,9 +272,9 @@ async def handle_media_stream(websocket: WebSocket):
                                     except asyncio.QueueFull:
                                         print("⚠️ Audio queue full, dropping frame")
                                     
-                                    # Yield every 5 frames to keep event loop responsive
+                                    # Yield every 2 frames for ultra-responsive interruption
                                     frame_count += 1
-                                    if frame_count % 5 == 0:
+                                    if frame_count % 2 == 0:
                                         await asyncio.sleep(0)
                                         
                         except Exception as e:
@@ -293,9 +294,9 @@ async def send_session_update(openai_ws):
         "session": {
             "turn_detection": {
                 "type": "server_vad",
-                "threshold": 0.3,
-                "prefix_padding_ms": 150,
-                "silence_duration_ms": 300
+                "threshold": 0.2,
+                "prefix_padding_ms": 50,
+                "silence_duration_ms": 200
             },
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
