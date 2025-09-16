@@ -166,12 +166,16 @@ async def handle_media_stream(websocket: WebSocket):
                             except asyncio.QueueEmpty:
                                 break
                     
+                    # Reset drop flag when user finishes speaking and AI can respond
+                    elif response["type"] == "input_audio_buffer.committed":
+                        print("🔊 User finished speaking - enabling AI audio")
+                        drop_audio = False
+                    
                     # Handle cancelled responses
                     elif response["type"] == "response.done":
                         if response.get("response", {}).get("status") == "cancelled":
                             print("❌ Response cancelled - flushing remaining audio")
-                            drop_audio = True
-                            # Clear the queue
+                            # Clear the queue but keep drop_audio as is
                             while not audio_queue.empty():
                                 try:
                                     audio_queue.get_nowait()
@@ -179,8 +183,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 except asyncio.QueueEmpty:
                                     break
                         else:
-                            # Reset drop flag for next response
-                            drop_audio = False
+                            print("✅ Response completed")
 
                     # Process audio deltas
                     if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
