@@ -773,40 +773,82 @@ async def send_session_update(openai_ws):
 
 آپ کو ہمیشہ اردو میں بات کرنی ہے۔ اگر صارف انگریزی یا کوئی اور زبان میں بات کرے تو انہیں شائستگی سے اردو میں جواب دیں۔ جب آرڈر مکمل ہو جائے تو فوراً save_order فنکشن استعمال کریں۔"""
 
+    # CRITICAL FIX: Proper OpenAI Realtime API session configuration
     session_update = {
         "type": "session.update",
         "session": {
+            "modalities": ["text", "audio"],
+            "instructions": urdu_prompt,
+            "voice": VOICE,
+            "input_audio_format": "g711_ulaw",  # CRITICAL: Set correct audio format for Twilio
+            "output_audio_format": "g711_ulaw", # CRITICAL: Match Twilio's expected format
+            "input_audio_transcription": {
+                "model": "whisper-1"
+            },
             "turn_detection": {
                 "type": "server_vad",
-                "threshold": 0.50,
-                "prefix_padding_ms": 0,
-                "silence_duration_ms": 500
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 200
             },
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "voice": VOICE,
-            "modalities": ["text", "audio"],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "save_order",
+                    "description": "Save a completed pizza order to the database.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "flavour": {
+                                "type": "string",
+                                "description": "Pizza flavour chosen by the customer (e.g., Pepperoni, Veggie)."
+                            },
+                            "size": {
+                                "type": "string",
+                                "description": "Pizza size.",
+                                "enum": ["Small", "Medium", "Large"]
+                            },
+                            "drink": {
+                                "type": "string",
+                                "description": "Optional drink choice. If none, send an empty string."
+                            },
+                            "address": {
+                                "type": "string",
+                                "description": "Delivery address (street, area, city)."
+                            },
+                            "customer_name": {
+                                "type": "string",
+                                "description": "Customer name."
+                            }
+                        },
+                        "required": ["flavour", "size", "address", "customer_name"]
+                    }
+                }
+            ],
+            "tool_choice": "auto",
             "temperature": 0.8,
-            "speed": 0.9,
-            "instructions": urdu_prompt,
-            "tools": [SAVE_ORDER_FUNCTION],
-            "tool_choice": "auto"
+            "max_response_output_tokens": 4096
         }
     }
     
-    print(f"🔧 Sending session update with Urdu prompt and save_order function")
+    print(f"🔧 CRITICAL FIX: Sending corrected session update for Twilio audio compatibility")
     print("Session config summary:")
     print(f"- Instructions: {len(urdu_prompt)} chars (Urdu pizza prompt)")
     print(f"- Tools: {len(session_update['session']['tools'])} function(s)")
     print(f"- Voice: {VOICE}")
+    print(f"- AUDIO FORMAT: {session_update['session']['input_audio_format']} -> {session_update['session']['output_audio_format']}")
     print(f"- Tool choice: {session_update['session']['tool_choice']}")
     
     try:
         await openai_ws.send(json.dumps(session_update))
-        print("✅ Session update sent successfully")
+        print("✅ FIXED session update sent successfully")
+        
+        # CRITICAL: Wait briefly for session confirmation
+        await asyncio.sleep(0.1)
+        
     except Exception as e:
-        print(f"❌ Failed to send session update: {e}")
-        raise
+        print(f"❌ CRITICAL: Failed to send session update: {e}")
+        raise e
 # =========================================
 # MAIN
 # =========================================
