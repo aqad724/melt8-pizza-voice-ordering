@@ -545,6 +545,30 @@ async def handle_media_stream(websocket: WebSocket):
                         return result
                     except Exception:
                         return False
+                
+                def detect_strong_user_speech(audio_b64):
+                    """CRITICAL FIX: Much more restrictive VAD to prevent AI voice false positives"""
+                    try:
+                        data = base64.b64decode(audio_b64, validate=False)
+                        if not data or len(data) < 160:  # Require longer audio for confidence
+                            return False
+                        s = _ulaw_to_linear(data)
+                        N = len(s)
+                        abs_vals = [abs(x) for x in s]
+                        mean_abs = sum(abs_vals) / N
+                        loud_ratio = sum(1 for v in abs_vals if v > 1200) / N  # Higher threshold
+                        peak = max(abs_vals)
+                        
+                        # CRITICAL: Much stricter criteria to avoid false positives from AI voice
+                        strong_signal = (peak > 4000 and loud_ratio > 0.05) or (mean_abs > 800 and loud_ratio > 0.08)
+                        
+                        if strong_signal:
+                            print(f"🔍 [{connection_id}] Strong speech detected - peak: {peak}, mean: {mean_abs:.1f}, loud_ratio: {loud_ratio:.3f}")
+                        
+                        return strong_signal
+                    except Exception as e:
+                        print(f"❌ [{connection_id}] Error in strong speech detection: {e}")
+                        return False
                         
                 async def receive_from_twilio():
                     nonlocal stream_sid, drop_audio, ai_speaking
@@ -552,22 +576,29 @@ async def handle_media_stream(websocket: WebSocket):
                         async for message in websocket.iter_text():
                             data = json.loads(message)
                             if data["event"] == "media":
-                                # Local preemptive VAD for instant interruption
-                                if ai_speaking and detect_speech_energy(data["media"]["payload"]):
-                                    print(f"🚀 [{connection_id}] INSTANT interruption detected locally!")
-                                    drop_audio = True
-                                    ai_speaking = False
-                                    # Send cancel to OpenAI to stop generation
-                                    try:
-                                        await openai_ws.send(json.dumps({"type": "response.cancel"}))
-                                    except:
-                                        pass
-
-                                audio_append = {
-                                    "type": "input_audio_buffer.append",
-                                    "audio": data["media"]["payload"]
-                                }
-                                await openai_ws.send(json.dumps(audio_append))
+                                # CRITICAL FIX: Skip processing audio during AI speech to prevent feedback loop
+                                if ai_speaking:
+                                    # Check for STRONG user interruption signal only
+                                    if detect_strong_user_speech(data["media"]["payload"]):
+                                        print(f"🎤 [{connection_id}] STRONG user interruption detected during AI speech!")
+                                        drop_audio = True
+                                        ai_speaking = False
+                                        # Send cancel to OpenAI to stop generation
+                                        try:
+                                            await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                                        except:
+                                            pass
+                                    else:
+                                        # CRITICAL: Drop audio during AI speech to prevent feedback
+                                        continue
+                                
+                                # CRITICAL FIX: Only send audio when AI is NOT speaking
+                                if not ai_speaking:
+                                    audio_append = {
+                                        "type": "input_audio_buffer.append",
+                                        "audio": data["media"]["payload"]
+                                    }
+                                    await openai_ws.send(json.dumps(audio_append))
                             elif data["event"] == "start":
                                 stream_sid = data["start"]["streamSid"]
                                 print(f"📞 [{connection_id}] Stream started: {stream_sid}")
@@ -608,21 +639,35 @@ async def handle_media_stream(websocket: WebSocket):
                                 else:
                                     print(f"⚠️ [{connection_id}] Session configuration FAILED - Check above errors")
                             
-                            # Track when AI starts speaking
+                            # CRITICAL FIX: Enhanced AI speech state management
                             if response["type"] == "response.audio.start":
                                 ai_speaking = True
-                                print(f"🤖 [{connection_id}] AI started speaking")
+                                drop_audio = False  # Enable AI audio output
+                                print(f"🤖 [{connection_id}] AI started speaking - blocking user audio input")
 
-                            # Stop audio on interruption (fallback)
-                            elif response["type"] == "input_audio_buffer.speech_started":
-                                print(f"🎤 [{connection_id}] User started speaking - server VAD fallback")
-                                drop_audio = True
+                            elif response["type"] == "response.audio.done":
                                 ai_speaking = False
+                                print(f"🤖 [{connection_id}] AI finished speaking - enabling user audio input")
+
+                            # CRITICAL: More conservative interruption handling
+                            elif response["type"] == "input_audio_buffer.speech_started":
+                                if not ai_speaking:  # Only handle if AI wasn't speaking
+                                    print(f"🎤 [{connection_id}] User started speaking (server VAD)")
+                                else:
+                                    print(f"⚠️ [{connection_id}] Server VAD triggered during AI speech - potential feedback loop!")
+                                    # Don't immediately stop AI - let strong user speech detection handle it
+                                
+                            elif response["type"] == "input_audio_buffer.speech_stopped":
+                                if not ai_speaking:
+                                    print(f"🔇 [{connection_id}] User stopped speaking (server VAD)")
 
                             # Reset drop flag when user finishes speaking and AI can respond
                             elif response["type"] == "input_audio_buffer.committed":
-                                print(f"🔊 [{connection_id}] User finished speaking - enabling AI audio")
+                                print(f"🔊 [{connection_id}] User audio committed - AI can respond")
                                 drop_audio = False
+                                # Only set ai_speaking to false if we're not currently generating
+                                if ai_speaking:
+                                    print(f"⚠️ [{connection_id}] Audio committed during AI speech - possible interruption")
 
                             # Handle function calls from OpenAI - Enhanced with better debugging and multiple event support
                             elif response["type"] == "response.function_call_arguments.delta":
@@ -787,9 +832,9 @@ async def send_session_update(openai_ws):
             },
             "turn_detection": {
                 "type": "server_vad",
-                "threshold": 0.5,
-                "prefix_padding_ms": 300,
-                "silence_duration_ms": 200
+                "threshold": 0.7,  # CRITICAL FIX: Higher threshold to prevent AI voice triggering
+                "prefix_padding_ms": 500,  # More padding to avoid cutting user speech
+                "silence_duration_ms": 800  # Longer silence required to prevent false triggers from AI voice
             },
             "tools": [
                 {
