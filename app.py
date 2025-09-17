@@ -580,6 +580,34 @@ async def handle_media_stream(websocket: WebSocket):
                             response = json.loads(openai_message)
                             if response["type"] in LOG_EVENT_TYPES:
                                 print(f"Event: {response['type']}", response)
+                            
+                            # Validate session configuration was accepted
+                            if response["type"] == "session.created":
+                                session_data = response.get("session", {})
+                                
+                                # Check if our instructions were applied
+                                instructions = session_data.get("instructions", "")
+                                if "Melt 8" in instructions and "اردو" in instructions:
+                                    print(f"✅ [{connection_id}] Urdu pizza prompt applied successfully!")
+                                else:
+                                    print(f"❌ [{connection_id}] CRITICAL: Urdu prompt NOT applied!")
+                                    print(f"🔍 [{connection_id}] Received instructions: {instructions[:100]}...")
+                                
+                                # Check if save_order tool was registered
+                                tools = session_data.get("tools", [])
+                                save_order_found = any(tool.get("name") == "save_order" for tool in tools)
+                                if save_order_found:
+                                    print(f"✅ [{connection_id}] save_order function registered successfully!")
+                                else:
+                                    print(f"❌ [{connection_id}] CRITICAL: save_order function NOT registered!")
+                                    print(f"🔍 [{connection_id}] Received tools: {[t.get('name', 'unnamed') for t in tools]}")
+                                
+                                # Overall session configuration status
+                                if "Melt 8" in instructions and save_order_found:
+                                    print(f"🎉 [{connection_id}] Session configured perfectly - Ready for Urdu pizza orders!")
+                                else:
+                                    print(f"⚠️ [{connection_id}] Session configuration FAILED - Check above errors")
+                            
                             # Track when AI starts speaking
                             if response["type"] == "response.audio.start":
                                 ai_speaking = True
@@ -731,6 +759,20 @@ async def handle_media_stream(websocket: WebSocket):
 # SESSION UPDATE WITH PROMPT ID + VERSION
 # =========================================
 async def send_session_update(openai_ws):
+    # Urdu pizza ordering prompt
+    urdu_prompt = """آپ Melt 8 پزا ریستوراں کے لیے ایک اردو AI اسسٹنٹ ہیں۔ آپ کا کام یہ ہے:
+
+1. صارفین کو "السلام علیکم، ویلکم ٹو Melt 8" کے ساتھ خوش آمدید کہیں
+2. اردو میں پزا آرڈرز لیں اور صارفین کی مدد کریں  
+3. جب آرڈر مکمل ہو تو save_order فنکشن کو کال کریں
+4. مہذب، دوستانہ اور مددگار ٹون استعمال کریں
+5. صرف ضروری معلومات مانگیں: پزا کا ذائقہ، سائز، ڈرنک (اختیاری), پتہ، اور نام
+
+دستیاب پزا ذائقے: Pepperoni, Veggie, Margherita, BBQ Chicken, Hawaiian
+سائز: Small, Medium, Large
+
+آپ کو ہمیشہ اردو میں بات کرنی ہے۔ اگر صارف انگریزی یا کوئی اور زبان میں بات کرے تو انہیں شائستگی سے اردو میں جواب دیں۔ جب آرڈر مکمل ہو جائے تو فوراً save_order فنکشن استعمال کریں۔"""
+
     session_update = {
         "type": "session.update",
         "session": {
@@ -746,16 +788,25 @@ async def send_session_update(openai_ws):
             "modalities": ["text", "audio"],
             "temperature": 0.8,
             "speed": 0.9,
+            "instructions": urdu_prompt,
             "tools": [SAVE_ORDER_FUNCTION],
-            "tool_choice": "auto",
-            "prompt": {
-                "id": PROMPT_ID,
-                "version": PROMPT_VERSION
-            }
+            "tool_choice": "auto"
         }
     }
-    print("Sending session update:", json.dumps(session_update))
-    await openai_ws.send(json.dumps(session_update))
+    
+    print(f"🔧 Sending session update with Urdu prompt and save_order function")
+    print("Session config summary:")
+    print(f"- Instructions: {len(urdu_prompt)} chars (Urdu pizza prompt)")
+    print(f"- Tools: {len(session_update['session']['tools'])} function(s)")
+    print(f"- Voice: {VOICE}")
+    print(f"- Tool choice: {session_update['session']['tool_choice']}")
+    
+    try:
+        await openai_ws.send(json.dumps(session_update))
+        print("✅ Session update sent successfully")
+    except Exception as e:
+        print(f"❌ Failed to send session update: {e}")
+        raise
 # =========================================
 # MAIN
 # =========================================
