@@ -494,9 +494,44 @@ async def handle_media_stream(websocket: WebSocket):
     # Generate unique connection ID for tracking
     connection_id = f"conn_{str(uuid.uuid4())[:8]}"
     
-    # Extract customer phone number from query parameters
-    customer_phone = websocket.query_params.get("phone", "Unknown")
-    print(f"📱 [{connection_id}] Customer phone: {customer_phone}")
+    # Extract customer phone number from query parameters - CRITICAL FIX
+    customer_phone = "Unknown"
+    
+    # Debug: Show all available attributes
+    print(f"🔍 [{connection_id}] WebSocket object attributes: {dir(websocket)}")
+    
+    # Try multiple methods to extract phone parameter
+    try:
+        # Method 1: Direct query_params access
+        if hasattr(websocket, 'query_params'):
+            print(f"🔍 [{connection_id}] query_params available: {websocket.query_params}")
+            phone = websocket.query_params.get("phone")
+            if phone:
+                customer_phone = str(phone)
+                print(f"✅ [{connection_id}] Phone extracted via query_params: {customer_phone}")
+        
+        # Method 2: URL parsing fallback
+        if customer_phone == "Unknown":
+            if hasattr(websocket, 'url'):
+                url_str = str(websocket.url)
+                print(f"🔍 [{connection_id}] Full WebSocket URL: {url_str}")
+                
+                # Manual URL parsing
+                import urllib.parse
+                parsed_url = urllib.parse.urlparse(url_str)
+                query_dict = urllib.parse.parse_qs(parsed_url.query)
+                print(f"🔍 [{connection_id}] Parsed query dict: {query_dict}")
+                
+                if 'phone' in query_dict and query_dict['phone']:
+                    customer_phone = str(query_dict['phone'][0])
+                    print(f"✅ [{connection_id}] Phone extracted via URL parsing: {customer_phone}")
+        
+    except Exception as e:
+        print(f"❌ [{connection_id}] Error in phone extraction: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print(f"📱 [{connection_id}] FINAL customer phone: {customer_phone}")
     
     await websocket.accept()
 
@@ -517,7 +552,9 @@ async def handle_media_stream(websocket: WebSocket):
                 active_connections += 1
                 print(f"🔗 [{connection_id}] Connected successfully (Active: {active_connections})")
                 
-                await send_session_update(openai_ws)
+                # CRITICAL FIX: Do not send session update immediately - wait for session.created first
+                session_configured = False
+                print(f"⏳ [{connection_id}] Waiting for session.created before configuring...")
                 stream_sid = None
                 drop_audio = False
                 ai_speaking = False
@@ -612,15 +649,30 @@ async def handle_media_stream(websocket: WebSocket):
                     except Exception as e:
                         print(f"❌ [{connection_id}] Error receiving from Twilio: {e}")
                 async def send_to_twilio():
-                    nonlocal stream_sid, drop_audio, ai_speaking
+                    nonlocal stream_sid, drop_audio, ai_speaking, session_configured
                     try:
                         async for openai_message in openai_ws:
                             response = json.loads(openai_message)
                             if response["type"] in LOG_EVENT_TYPES:
                                 print(f"Event: {response['type']}", response)
                             
-                            # Validate session configuration was accepted
-                            if response["type"] == "session.created":
+                            # CRITICAL FIX: Send session update after receiving session.created
+                            if response["type"] == "session.created" and not session_configured:
+                                print(f"✅ [{connection_id}] session.created received, now sending our configuration...")
+                                try:
+                                    await send_session_update(openai_ws)
+                                    session_configured = True
+                                    print(f"📤 [{connection_id}] Session update sent successfully, waiting for session.updated...")
+                                except Exception as e:
+                                    print(f"❌ [{connection_id}] Failed to send session update: {e}")
+                                continue  # Skip validation this time, wait for session.updated
+                            
+                            # Handle session.updated confirmation
+                            elif response["type"] == "session.updated":
+                                print(f"🎯 [{connection_id}] session.updated received - validating configuration...")
+                                
+                            # Validate session configuration was accepted (for both session.created and session.updated)
+                            if response["type"] in ["session.created", "session.updated"]:
                                 session_data = response.get("session", {})
                                 
                                 # Check if our instructions were applied
@@ -893,13 +945,15 @@ async def send_session_update(openai_ws):
     
     try:
         await openai_ws.send(json.dumps(session_update))
-        print("✅ FIXED session update sent successfully")
+        print("✅ Session update sent successfully")
         
-        # CRITICAL: Wait briefly for session confirmation
+        # Wait briefly for session confirmation
         await asyncio.sleep(0.1)
         
     except Exception as e:
-        print(f"❌ CRITICAL: Failed to send session update: {e}")
+        print(f"❌ Failed to send session update: {e}")
+        import traceback
+        traceback.print_exc()
         raise e
 # =========================================
 # MAIN
