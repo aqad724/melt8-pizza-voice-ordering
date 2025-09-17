@@ -492,10 +492,18 @@ async def handle_incoming_call(request: Request):
         host = os.getenv("REPLIT_DEV_DOMAIN", request.url.hostname)
 
     # Pass call_sid instead of phone number to WebSocket
+    websocket_url = f"wss://{host}/media-stream?call_sid={call_sid}"
+    print(f"🔗 Generated WebSocket URL: {websocket_url}")
+    
     connect = Connect()
-    connect.stream(url=f"wss://{host}/media-stream?call_sid={call_sid}")
+    connect.stream(url=websocket_url)
     response.append(connect)
-    return HTMLResponse(content=str(response), media_type="application/xml")
+    
+    # Debug: Show the final TwiML response
+    twiml_response = str(response)
+    print(f"📋 TwiML Response: {twiml_response}")
+    
+    return HTMLResponse(content=twiml_response, media_type="application/xml")
 # =========================================
 # MEDIA STREAM HANDLER
 # =========================================
@@ -612,7 +620,7 @@ async def handle_media_stream(websocket: WebSocket):
                         return False
                         
                 async def receive_from_twilio():
-                    nonlocal stream_sid, drop_audio, ai_speaking
+                    nonlocal stream_sid, drop_audio, ai_speaking, customer_phone
                     try:
                         async for message in websocket.iter_text():
                             data = json.loads(message)
@@ -643,6 +651,21 @@ async def handle_media_stream(websocket: WebSocket):
                             elif data["event"] == "start":
                                 stream_sid = data["start"]["streamSid"]
                                 print(f"📞 [{connection_id}] Stream started: {stream_sid}")
+                                
+                                # CRITICAL FIX: Extract CallSid from Twilio start event
+                                twilio_call_sid = data["start"].get("callSid")
+                                if twilio_call_sid:
+                                    print(f"📞 [{connection_id}] CallSid from start event: {twilio_call_sid}")
+                                    
+                                    # Look up phone number in registry using the CallSid
+                                    if twilio_call_sid in phone_registry:
+                                        customer_phone = phone_registry[twilio_call_sid]
+                                        print(f"✅ [{connection_id}] Phone resolved from start event: {customer_phone}")
+                                    else:
+                                        print(f"❌ [{connection_id}] CallSid not found in phone registry: {twilio_call_sid}")
+                                        print(f"🔍 [{connection_id}] Registry contents: {phone_registry}")
+                                else:
+                                    print(f"❌ [{connection_id}] No CallSid in start event data")
                     except Exception as e:
                         print(f"❌ [{connection_id}] Error receiving from Twilio: {e}")
                 async def send_to_twilio():
