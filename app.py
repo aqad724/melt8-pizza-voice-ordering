@@ -80,6 +80,7 @@ app = FastAPI()
 
 # Connection tracking for concurrent calls
 active_connections = 0
+phone_registry = {}  # Store phone numbers by call session
 
 # Allow app to start without API key for webhook testing
 API_KEYS_CONFIGURED = bool(OPENAI_API_KEY)
@@ -442,15 +443,20 @@ async def handle_incoming_call(request: Request):
         return HTMLResponse(content=str(response), media_type="application/xml")
 
     # Extract customer phone number from Twilio webhook data
+    form_data = None
+    call_sid = "unknown"
+    
     try:
         if request.method == "POST":
             form_data = await request.form()
             caller_phone_raw = form_data.get("From", "Unknown")
+            call_sid = form_data.get("CallSid", "unknown")
             # Ensure we have a string, not UploadFile
             caller_phone = str(caller_phone_raw) if caller_phone_raw else "Unknown"
         else:
             # For GET requests (testing), use query parameter
             caller_phone = request.query_params.get("From", "Unknown")
+            call_sid = request.query_params.get("CallSid", "unknown")
         
         # Clean up phone number format (handle WhatsApp format and regular formats)
         if isinstance(caller_phone, str) and caller_phone != "Unknown":
@@ -466,6 +472,11 @@ async def handle_incoming_call(request: Request):
                 caller_phone = caller_phone[1:]  # Remove + prefix
             
         print(f"📞 Incoming call from: {caller_phone}")
+        
+        # Store phone number for this call session
+        phone_registry[call_sid] = caller_phone
+        print(f"📝 Stored phone {caller_phone} for call session {call_sid}")
+        
     except Exception as e:
         print(f"❌ Error extracting phone number: {e}")
         caller_phone = "Unknown"
@@ -480,9 +491,9 @@ async def handle_incoming_call(request: Request):
         # Use environment domain for Replit
         host = os.getenv("REPLIT_DEV_DOMAIN", request.url.hostname)
 
-    # Pass phone number as query parameter to WebSocket
+    # Pass call_sid instead of phone number to WebSocket
     connect = Connect()
-    connect.stream(url=f"wss://{host}/media-stream?phone={caller_phone}")
+    connect.stream(url=f"wss://{host}/media-stream?call_sid={call_sid}")
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 # =========================================
@@ -494,42 +505,28 @@ async def handle_media_stream(websocket: WebSocket):
     # Generate unique connection ID for tracking
     connection_id = f"conn_{str(uuid.uuid4())[:8]}"
     
-    # Extract customer phone number from query parameters - CRITICAL FIX
+    # Extract call session ID and get phone number from registry
     customer_phone = "Unknown"
+    call_sid = "unknown"
     
-    # Debug: Show all available attributes
-    print(f"🔍 [{connection_id}] WebSocket object attributes: {dir(websocket)}")
-    
-    # Try multiple methods to extract phone parameter
     try:
-        # Method 1: Direct query_params access
+        # Extract call_sid from WebSocket query parameters
         if hasattr(websocket, 'query_params'):
-            print(f"🔍 [{connection_id}] query_params available: {websocket.query_params}")
-            phone = websocket.query_params.get("phone")
-            if phone:
-                customer_phone = str(phone)
-                print(f"✅ [{connection_id}] Phone extracted via query_params: {customer_phone}")
-        
-        # Method 2: URL parsing fallback
-        if customer_phone == "Unknown":
-            if hasattr(websocket, 'url'):
-                url_str = str(websocket.url)
-                print(f"🔍 [{connection_id}] Full WebSocket URL: {url_str}")
-                
-                # Manual URL parsing
-                import urllib.parse
-                parsed_url = urllib.parse.urlparse(url_str)
-                query_dict = urllib.parse.parse_qs(parsed_url.query)
-                print(f"🔍 [{connection_id}] Parsed query dict: {query_dict}")
-                
-                if 'phone' in query_dict and query_dict['phone']:
-                    customer_phone = str(query_dict['phone'][0])
-                    print(f"✅ [{connection_id}] Phone extracted via URL parsing: {customer_phone}")
-        
+            call_sid = websocket.query_params.get('call_sid', 'unknown')
+            print(f"📞 [{connection_id}] Call SID: {call_sid}")
+            
+            # Get phone number from registry
+            if call_sid in phone_registry:
+                customer_phone = phone_registry[call_sid]
+                print(f"✅ [{connection_id}] Phone retrieved from registry: {customer_phone}")
+            else:
+                print(f"❌ [{connection_id}] No phone found in registry for call SID: {call_sid}")
+                print(f"🔍 [{connection_id}] Current registry: {phone_registry}")
+        else:
+            print(f"❌ [{connection_id}] No query_params available")
+            
     except Exception as e:
         print(f"❌ [{connection_id}] Error in phone extraction: {e}")
-        import traceback
-        traceback.print_exc()
     
     print(f"📱 [{connection_id}] FINAL customer phone: {customer_phone}")
     
