@@ -5,11 +5,15 @@ import asyncio
 import websockets
 import time
 import uuid
-from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, WebSocket, Request, Depends, HTTPException, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say
 from dotenv import load_dotenv
 import uvicorn
+import secrets
 load_dotenv()
 # =========================================
 # CONFIGURATION
@@ -18,6 +22,50 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Replace with your Prompt ID + Version
 PROMPT_ID = "pmpt_68bdd42ebbb881948ffca4f752efaec406a110ab981d5f90"
 PROMPT_VERSION = ""
+
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Chef Dashboard Security Configuration
+CHEF_USERNAME = os.getenv("CHEF_USERNAME", "chef")
+CHEF_PASSWORD = os.getenv("CHEF_PASSWORD", "pizza123")
+security = HTTPBasic()
+
+print(f"🔐 Chef dashboard authentication configured for user: {CHEF_USERNAME}")
+
+# Function definition for OpenAI
+SAVE_ORDER_FUNCTION = {
+    "name": "save_order",
+    "description": "Save a completed pizza order to the backend file storage (orders.json).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "flavour": {
+                "type": "string",
+                "description": "Pizza flavour chosen by the customer (e.g., Pepperoni, Veggie)."
+            },
+            "size": {
+                "type": "string",
+                "description": "Pizza size.",
+                "enum": ["Small", "Medium", "Large"]
+            },
+            "drink": {
+                "type": "string",
+                "description": "Optional drink choice. If none, send an empty string or omit."
+            },
+            "address": {
+                "type": "string",
+                "description": "Delivery address (street, area, city)."
+            },
+            "customer_name": {
+                "type": "string",
+                "description": "Optional customer name."
+            }
+        },
+        "additionalProperties": False,
+        "required": ["flavour", "size", "drink", "address", "customer_name"]
+    }
+}
 VOICE = "alloy"
 LOG_EVENT_TYPES = [
     "response.content.done",
@@ -52,6 +100,334 @@ async def connection_status():
         "concurrent_support": "enabled",
         "api_configured": API_KEYS_CONFIGURED
     }
+
+# =========================================
+# DATABASE FUNCTIONS
+# =========================================
+def get_db_connection():
+    """Get database connection"""
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
+async def save_order_to_db(flavour, size, drink, address, customer_name, customer_phone=None):
+    """Save order to database"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            INSERT INTO orders (flavour, size, drink, address, customer_name, customer_phone)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id, order_time
+        """, (flavour, size, drink or '', address, customer_name or '', customer_phone))
+        
+        result = cursor.fetchone()
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        if result:
+            order_id = dict(result).get('id', 'Unknown')
+            print(f"✅ Order saved: ID {order_id} - {size} {flavour} for {customer_name or 'Unknown'}")
+            return dict(result)
+        else:
+            print(f"❌ Error: No result returned when saving order")
+            return None
+    except Exception as e:
+        print(f"❌ Error saving order: {e}")
+        return None
+
+# =========================================
+# AUTHENTICATION
+# =========================================
+def authenticate_chef(credentials: HTTPBasicCredentials = Depends(security)):
+    """
+    Authenticate chef dashboard access using HTTP Basic Authentication.
+    Returns True if credentials are valid, otherwise raises HTTPException.
+    """
+    # Use secrets.compare_digest for constant-time string comparison to prevent timing attacks
+    is_correct_username = secrets.compare_digest(credentials.username, CHEF_USERNAME)
+    is_correct_password = secrets.compare_digest(credentials.password, CHEF_PASSWORD)
+    
+    if not (is_correct_username and is_correct_password):
+        print(f"❌ Unauthorized chef dashboard access attempt: {credentials.username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials for chef dashboard access",
+            headers={"WWW-Authenticate": "Basic"}
+        )
+    
+    print(f"✅ Chef dashboard access granted to: {credentials.username}")
+    return True
+
+# =========================================
+# FUNCTION CALL HANDLER
+# =========================================
+async def handle_function_call(connection_id, customer_phone, call_id, function_name, arguments, openai_ws):
+    """
+    Enhanced function call handler with proper error handling and response formatting
+    """
+    print(f"🔧 [{connection_id}] Executing function: {function_name} with args: {arguments}")
+    
+    try:
+        if function_name == "save_order":
+            # Use the customer phone number captured from Twilio
+            print(f"💾 [{connection_id}] Saving order for customer: {customer_phone}")
+            
+            # Validate required arguments
+            required_fields = ['flavour', 'size', 'address']
+            missing_fields = [field for field in required_fields if not arguments.get(field)]
+            
+            if missing_fields:
+                print(f"❌ [{connection_id}] Missing required fields: {missing_fields}")
+                function_result = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps({
+                            "success": False,
+                            "message": f"Missing required information: {', '.join(missing_fields)}",
+                            "missing_fields": missing_fields
+                        })
+                    }
+                }
+            else:
+                # Save order to database
+                result = await save_order_to_db(
+                    flavour=arguments.get("flavour"),
+                    size=arguments.get("size"),
+                    drink=arguments.get("drink", ""),
+                    address=arguments.get("address"),
+                    customer_name=arguments.get("customer_name", ""),
+                    customer_phone=customer_phone
+                )
+                
+                # Create function result based on database operation
+                if result:
+                    function_result = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps({
+                                "success": True,
+                                "order_id": result.get("id"),
+                                "order_time": str(result.get("order_time", "")),
+                                "message": f"Order #{result.get('id')} saved successfully! Your {arguments.get('size')} {arguments.get('flavour')} pizza will be prepared shortly."
+                            })
+                        }
+                    }
+                    print(f"✅ [{connection_id}] Function call successful - Order ID: {result.get('id')}")
+                else:
+                    function_result = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps({
+                                "success": False,
+                                "message": "Sorry, there was a technical issue saving your order. Please try again.",
+                                "error_type": "database_error"
+                            })
+                        }
+                    }
+                    print(f"❌ [{connection_id}] Function call failed - Database error")
+        else:
+            # Handle unknown function calls
+            print(f"⚠️ [{connection_id}] Unknown function: {function_name}")
+            function_result = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps({
+                        "success": False,
+                        "message": f"Unknown function: {function_name}",
+                        "error_type": "unknown_function"
+                    })
+                }
+            }
+        
+        # Send function result back to OpenAI
+        print(f"📤 [{connection_id}] Sending function result to OpenAI")
+        await openai_ws.send(json.dumps(function_result))
+        
+        # Request AI to continue/respond
+        await openai_ws.send(json.dumps({"type": "response.create"}))
+        print(f"✅ [{connection_id}] Function call handling completed")
+        
+    except Exception as e:
+        print(f"❌ [{connection_id}] Critical error in function call handler: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Send error response to OpenAI
+        try:
+            error_result = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps({
+                        "success": False,
+                        "message": "Internal error occurred while processing your request.",
+                        "error_type": "internal_error"
+                    })
+                }
+            }
+            await openai_ws.send(json.dumps(error_result))
+            await openai_ws.send(json.dumps({"type": "response.create"}))
+        except Exception as send_error:
+            print(f"❌ [{connection_id}] Failed to send error response: {send_error}")
+
+# =========================================
+# CHEF DASHBOARD ROUTES  
+# =========================================
+@app.get("/chef-dashboard")
+async def chef_dashboard(authenticated: bool = Depends(authenticate_chef)):
+    """Serve chef dashboard HTML"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Melt 8 - Chef Dashboard</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+            .header { background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+            .order-card { background: white; border-radius: 8px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+            .order-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+            .order-id { font-weight: bold; color: #e74c3c; }
+            .order-time { color: #7f8c8d; font-size: 0.9em; }
+            .status-new { background: #e74c3c; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; }
+            .status-preparing { background: #f39c12; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; }
+            .status-ready { background: #27ae60; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; }
+            .order-details { margin: 10px 0; }
+            .customer-info { background: #ecf0f1; padding: 10px; border-radius: 4px; margin: 10px 0; }
+            .btn { padding: 8px 12px; margin: 2px; border: none; border-radius: 4px; cursor: pointer; }
+            .btn-warning { background: #f39c12; color: white; }
+            .btn-success { background: #27ae60; color: white; }
+            .btn-info { background: #3498db; color: white; }
+            .refresh-btn { position: fixed; top: 20px; right: 20px; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🍕 Melt 8 - Chef Dashboard</h1>
+            <p>Real-time pizza orders from voice calls</p>
+        </div>
+        
+        <button class="btn btn-info refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+        
+        <div id="orders-container">
+            <p>Loading orders...</p>
+        </div>
+        
+        <script>
+            async function loadOrders() {
+                try {
+                    const response = await fetch('/api/orders');
+                    const orders = await response.json();
+                    
+                    const container = document.getElementById('orders-container');
+                    if (orders.length === 0) {
+                        container.innerHTML = '<p>No orders yet. Waiting for customers to call...</p>';
+                        return;
+                    }
+                    
+                    container.innerHTML = orders.map(order => `
+                        <div class="order-card">
+                            <div class="order-header">
+                                <span class="order-id">Order #${order.id}</span>
+                                <span class="status-${order.status}">${order.status.toUpperCase()}</span>
+                                <span class="order-time">${new Date(order.order_time).toLocaleString()}</span>
+                            </div>
+                            <div class="order-details">
+                                <strong>🍕 ${order.size} ${order.flavour} Pizza</strong>
+                                ${order.drink ? `<br>🥤 ${order.drink}` : ''}
+                            </div>
+                            <div class="customer-info">
+                                <strong>Customer:</strong> ${order.customer_name || 'Unknown'}<br>
+                                <strong>Phone:</strong> ${order.customer_phone || 'N/A'}<br>
+                                <strong>Address:</strong> ${order.address}
+                            </div>
+                            <div style="margin-top: 10px;">
+                                ${order.status === 'new' ? `<button class="btn btn-warning" onclick="updateStatus(${order.id}, 'preparing')">Start Preparing</button>` : ''}
+                                ${order.status === 'preparing' ? `<button class="btn btn-success" onclick="updateStatus(${order.id}, 'ready')">Mark Ready</button>` : ''}
+                                ${order.status === 'ready' ? `<button class="btn btn-info" onclick="updateStatus(${order.id}, 'delivered')">Mark Delivered</button>` : ''}
+                            </div>
+                        </div>
+                    `).join('');
+                } catch (error) {
+                    document.getElementById('orders-container').innerHTML = '<p>Error loading orders. Please refresh.</p>';
+                }
+            }
+            
+            async function updateStatus(orderId, status) {
+                try {
+                    await fetch(`/api/orders/${orderId}/status`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ status })
+                    });
+                    loadOrders(); // Reload orders
+                } catch (error) {
+                    alert('Error updating order status');
+                }
+            }
+            
+            // Load orders on page load
+            loadOrders();
+            
+            // Auto-refresh every 10 seconds
+            setInterval(loadOrders, 10000);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.get("/api/orders")
+async def get_orders(authenticated: bool = Depends(authenticate_chef)):
+    """Get all orders for chef dashboard"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT * FROM orders 
+            ORDER BY order_time DESC
+        """)
+        
+        orders = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return [dict(order) for order in orders]
+    except Exception as e:
+        print(f"❌ Error fetching orders: {e}")
+        return []
+
+@app.put("/api/orders/{order_id}/status")
+async def update_order_status(order_id: int, status_data: dict, authenticated: bool = Depends(authenticate_chef)):
+    """Update order status"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE orders SET status = %s WHERE id = %s
+        """, (status_data['status'], order_id))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return {"success": True}
+    except Exception as e:
+        print(f"❌ Error updating order status: {e}")
+        return {"success": False, "error": str(e)}
 # =========================================
 # TWILIO VOICE WEBHOOK
 # =========================================
@@ -64,17 +440,42 @@ async def handle_incoming_call(request: Request):
         response.say("Webhook is working! However, the AI voice assistant is not fully configured yet. Please add your API keys to enable voice features.")
         return HTMLResponse(content=str(response), media_type="application/xml")
 
+    # Extract customer phone number from Twilio webhook data
+    try:
+        if request.method == "POST":
+            form_data = await request.form()
+            caller_phone_raw = form_data.get("From", "Unknown")
+            # Ensure we have a string, not UploadFile
+            caller_phone = str(caller_phone_raw) if caller_phone_raw else "Unknown"
+        else:
+            # For GET requests (testing), use query parameter
+            caller_phone = request.query_params.get("From", "Unknown")
+        
+        # Clean up phone number format (remove +1 prefix if present) 
+        if isinstance(caller_phone, str) and caller_phone != "Unknown":
+            if caller_phone.startswith("+1") and len(caller_phone) == 12:
+                caller_phone = caller_phone[2:]  # Remove +1 prefix
+            elif caller_phone.startswith("+"):
+                caller_phone = caller_phone[1:]  # Remove + prefix
+            
+        print(f"📞 Incoming call from: {caller_phone}")
+    except Exception as e:
+        print(f"❌ Error extracting phone number: {e}")
+        caller_phone = "Unknown"
+
     response.say("Please wait while we connect your call to the AI voice assistant.")
     response.pause(length=1)
     response.say("Okay, you can start talking!")
+    
     # Get the host from the request or environment
     host = request.url.hostname
     if not host or host == "127.0.0.1" or host == "localhost":
         # Use environment domain for Replit
         host = os.getenv("REPLIT_DEV_DOMAIN", request.url.hostname)
 
+    # Pass phone number as query parameter to WebSocket
     connect = Connect()
-    connect.stream(url=f"wss://{host}/media-stream")
+    connect.stream(url=f"wss://{host}/media-stream?phone={caller_phone}")
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 # =========================================
@@ -85,6 +486,10 @@ async def handle_media_stream(websocket: WebSocket):
     global active_connections
     # Generate unique connection ID for tracking
     connection_id = f"conn_{str(uuid.uuid4())[:8]}"
+    
+    # Extract customer phone number from query parameters
+    customer_phone = websocket.query_params.get("phone", "Unknown")
+    print(f"📱 [{connection_id}] Customer phone: {customer_phone}")
     
     await websocket.accept()
 
@@ -191,13 +596,84 @@ async def handle_media_stream(websocket: WebSocket):
                                 print(f"🔊 [{connection_id}] User finished speaking - enabling AI audio")
                                 drop_audio = False
 
-                            # Handle cancelled responses
+                            # Handle function calls from OpenAI - Enhanced with better debugging and multiple event support
+                            elif response["type"] == "response.function_call_arguments.delta":
+                                # Function call in progress, log with details
+                                delta_content = response.get('delta', '')
+                                print(f"🔧 [{connection_id}] Function call streaming delta: {delta_content[:100]}...")
+                            
+                            elif response["type"] == "response.function_call_arguments.done":
+                                # Function call completed via arguments.done event
+                                print(f"🔧 [{connection_id}] Function call arguments.done event received")
+                                print(f"🔍 [{connection_id}] Full event structure: {json.dumps(response, indent=2)}")
+                                
+                                try:
+                                    call_id = response.get("call_id")
+                                    function_name = response.get("name") 
+                                    arguments_str = response.get("arguments", "{}")
+                                    
+                                    print(f"🔍 [{connection_id}] Extracted - call_id: {call_id}, name: {function_name}, args: {arguments_str}")
+                                    
+                                    if not call_id:
+                                        print(f"❌ [{connection_id}] Missing call_id in function call event")
+                                        continue
+                                    
+                                    if not function_name:
+                                        print(f"❌ [{connection_id}] Missing function name in function call event")
+                                        continue
+                                    
+                                    # Parse arguments safely
+                                    try:
+                                        arguments = json.loads(arguments_str) if arguments_str else {}
+                                    except json.JSONDecodeError as e:
+                                        print(f"❌ [{connection_id}] Failed to parse function arguments: {e}")
+                                        arguments = {}
+                                    
+                                    # Use the enhanced function call handler
+                                    await handle_function_call(connection_id, customer_phone, call_id, function_name, arguments, openai_ws)
+                                        
+                                except Exception as e:
+                                    print(f"❌ [{connection_id}] Error processing function_call_arguments.done: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+
+                            # Handle response completion and check for function calls
                             elif response["type"] == "response.done":
                                 ai_speaking = False
                                 if response.get("response", {}).get("status") == "cancelled":
                                     print(f"❌ [{connection_id}] Response cancelled")
                                 else:
                                     print(f"✅ [{connection_id}] Response completed")
+                                    
+                                    # Alternative function call handling via response.done event
+                                    # Some implementations provide function calls in the output field
+                                    try:
+                                        output = response.get("output", [])
+                                        if output:
+                                            print(f"🔍 [{connection_id}] Checking response.done output for function calls: {len(output)} items")
+                                            
+                                        for item in output:
+                                            content = item.get("content", [])
+                                            for content_item in content:
+                                                if content_item.get("type") == "function_call":
+                                                    call_id = content_item.get("call_id")
+                                                    function_name = content_item.get("name")
+                                                    arguments_str = content_item.get("arguments", "{}")
+                                                    
+                                                    print(f"🔧 [{connection_id}] Function call via response.done: {function_name}")
+                                                    print(f"🔍 [{connection_id}] call_id: {call_id}, args: {arguments_str}")
+                                                    
+                                                    if call_id and function_name:
+                                                        try:
+                                                            arguments = json.loads(arguments_str) if arguments_str else {}
+                                                        except json.JSONDecodeError as e:
+                                                            print(f"❌ [{connection_id}] Failed to parse function arguments from response.done: {e}")
+                                                            arguments = {}
+                                                        
+                                                        # Use the enhanced function call handler
+                                                        await handle_function_call(connection_id, customer_phone, call_id, function_name, arguments, openai_ws)
+                                    except Exception as e:
+                                        print(f"❌ [{connection_id}] Error processing function calls from response.done: {e}")
                             # Process audio deltas with responsive yielding
                             if response["type"] == "response.audio.delta" and response.get("delta") and not drop_audio:
                                 try:
@@ -270,6 +746,8 @@ async def send_session_update(openai_ws):
             "modalities": ["text", "audio"],
             "temperature": 0.8,
             "speed": 0.9,
+            "tools": [SAVE_ORDER_FUNCTION],
+            "tool_choice": "auto",
             "prompt": {
                 "id": PROMPT_ID,
                 "version": PROMPT_VERSION

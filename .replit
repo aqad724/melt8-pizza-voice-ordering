@@ -1,4 +1,4 @@
-modules = ["python-3.11"]
+modules = ["python-3.11", "postgresql-16", "python3"]
 [agent]
 expertMode = true
 integrations = ["python_openai:1.0.0", "twilio_send_message:1.0.0"]
