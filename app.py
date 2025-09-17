@@ -101,6 +101,7 @@ async def connection_status():
         "api_configured": API_KEYS_CONFIGURED
     }
 
+
 # =========================================
 # DATABASE FUNCTIONS
 # =========================================
@@ -451,8 +452,14 @@ async def handle_incoming_call(request: Request):
             # For GET requests (testing), use query parameter
             caller_phone = request.query_params.get("From", "Unknown")
         
-        # Clean up phone number format (remove +1 prefix if present) 
+        # Clean up phone number format (handle WhatsApp format and regular formats)
         if isinstance(caller_phone, str) and caller_phone != "Unknown":
+            # Handle WhatsApp format: whatsapp:+923270737372
+            if caller_phone.startswith("whatsapp:"):
+                caller_phone = caller_phone[9:]  # Remove "whatsapp:" prefix
+                print(f"🟢 WhatsApp call detected, extracted number: {caller_phone}")
+            
+            # Now handle regular phone number prefixes
             if caller_phone.startswith("+1") and len(caller_phone) == 12:
                 caller_phone = caller_phone[2:]  # Remove +1 prefix
             elif caller_phone.startswith("+"):
