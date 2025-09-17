@@ -27,7 +27,7 @@ PROMPT_VERSION = ""
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Deployment configuration
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "pizza.autoreply.my")
+PUBLIC_BASE_URL = "pizza.autoreply.my"  # Force correct domain
 PORT = int(os.getenv("PORT", "5000"))
 
 # Chef Dashboard Security Configuration
