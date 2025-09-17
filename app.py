@@ -17,7 +17,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Replace with your Prompt ID + Version
 PROMPT_ID = "pmpt_68bdd42ebbb881948ffca4f752efaec406a110ab981d5f90"
-PROMPT_VERSION = "14"
+PROMPT_VERSION = ""
 VOICE = "alloy"
 LOG_EVENT_TYPES = [
     "response.content.done",
