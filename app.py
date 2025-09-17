@@ -63,7 +63,7 @@ SAVE_ORDER_FUNCTION = {
             }
         },
         "additionalProperties": False,
-        "required": ["flavour", "size", "drink", "address", "customer_name"]
+        "required": ["flavour", "size", "address", "customer_name"]
     }
 }
 VOICE = "alloy"
