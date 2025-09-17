@@ -490,7 +490,10 @@ async def handle_incoming_call(request: Request):
     response.say("Okay, you can start talking!")
     
     # Use fixed deployment URL for WebSocket (not workflow preview URL)
-    websocket_url = f"wss://{PUBLIC_BASE_URL}/media-stream?call_sid={call_sid}"
+    # Pass phone number in URL to avoid cross-process memory issues
+    import urllib.parse
+    encoded_phone = urllib.parse.quote(caller_phone)
+    websocket_url = f"wss://{PUBLIC_BASE_URL}/media-stream?call_sid={call_sid}&customer_phone={encoded_phone}"
     print(f"🔗 Generated WebSocket URL: {websocket_url}")
     
     connect = Connect()
@@ -521,8 +524,12 @@ async def handle_media_stream(websocket: WebSocket):
             call_sid = websocket.query_params.get('call_sid', 'unknown')
             print(f"📞 [{connection_id}] Call SID: {call_sid}")
             
-            # Get phone number from registry
-            if call_sid in phone_registry:
+            # Get phone number from URL parameters first (reliable), then fall back to registry
+            url_phone = websocket.query_params.get('customer_phone')
+            if url_phone:
+                customer_phone = url_phone
+                print(f"✅ [{connection_id}] Phone retrieved from URL: {customer_phone}")
+            elif call_sid in phone_registry:
                 customer_phone = phone_registry[call_sid]
                 print(f"✅ [{connection_id}] Phone retrieved from registry: {customer_phone}")
             else:
