@@ -26,6 +26,10 @@ PROMPT_VERSION = ""
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Deployment configuration
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "your-deployment.replit.dev")
+PORT = int(os.getenv("PORT", "5000"))
+
 # Chef Dashboard Security Configuration
 CHEF_USERNAME = os.getenv("CHEF_USERNAME", "chef")
 CHEF_PASSWORD = os.getenv("CHEF_PASSWORD", "pizza123")
@@ -485,14 +489,8 @@ async def handle_incoming_call(request: Request):
     response.pause(length=1)
     response.say("Okay, you can start talking!")
     
-    # Get the host from the request or environment
-    host = request.url.hostname
-    if not host or host == "127.0.0.1" or host == "localhost":
-        # Use environment domain for Replit
-        host = os.getenv("REPLIT_DEV_DOMAIN", request.url.hostname)
-
-    # Pass call_sid instead of phone number to WebSocket
-    websocket_url = f"wss://{host}/media-stream?call_sid={call_sid}"
+    # Use fixed deployment URL for WebSocket (not workflow preview URL)
+    websocket_url = f"wss://{PUBLIC_BASE_URL}/media-stream?call_sid={call_sid}"
     print(f"🔗 Generated WebSocket URL: {websocket_url}")
     
     connect = Connect()
@@ -1008,4 +1006,4 @@ Remember: ADDRESS IS MANDATORY! Never skip it!"""
 # MAIN
 # =========================================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
